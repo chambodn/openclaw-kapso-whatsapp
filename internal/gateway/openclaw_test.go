@@ -318,6 +318,24 @@ func TestConnectIncludesDeviceIdentity(t *testing.T) {
 		t.Fatalf("unmarshal connect frame: %v", err)
 	}
 
+	// Regression for #36: the gateway (OpenClaw 2026.5.27+) requires protocol
+	// 4, accepting a connect only when the advertised range includes it.
+	var proto struct {
+		Params struct {
+			MinProtocol int `json:"minProtocol"`
+			MaxProtocol int `json:"maxProtocol"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &proto); err != nil {
+		t.Fatalf("unmarshal protocol range: %v", err)
+	}
+	if proto.Params.MaxProtocol < 4 {
+		t.Errorf("maxProtocol: got %d, want >= 4 (gateway requires protocol 4)", proto.Params.MaxProtocol)
+	}
+	if proto.Params.MinProtocol > 4 {
+		t.Errorf("minProtocol: got %d, want <= 4", proto.Params.MinProtocol)
+	}
+
 	if frame.Params.Device == nil {
 		t.Fatal("device field missing from connect request")
 	}
