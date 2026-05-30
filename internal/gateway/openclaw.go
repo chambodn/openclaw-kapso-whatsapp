@@ -235,8 +235,13 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 		ID:     oc.nextID(),
 		Method: "connect",
 		Params: connectParams{
+			// Advertise a protocol range. The gateway accepts the connection
+			// when this range includes its PROTOCOL_VERSION. OpenClaw
+			// 2026.5.27 requires protocol 4; older gateways speak 3. The
+			// device-auth payload (v3, see buildDeviceAuthPayloadV3) is
+			// unchanged across both, so the [3,4] range is backward compatible.
 			MinProtocol: 3,
-			MaxProtocol: 3,
+			MaxProtocol: 4,
 			Client: clientInfo{
 				ID:          clientID,
 				DisplayName: "Kapso WhatsApp Bridge",
