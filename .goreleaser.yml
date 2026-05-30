@@ -30,10 +30,10 @@ builds:
       - arm64
 
 archives:
-  - format: tar.gz
+  - formats: [tar.gz]
     format_overrides:
       - goos: windows
-        format: zip
+        formats: [zip]
     name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
 
 checksum:
@@ -46,3 +46,50 @@ changelog:
       - "^docs:"
       - "^chore:"
       - "^ci:"
+
+# Build one image per architecture from the prebuilt bridge binary, then stitch
+# them into a single multi-arch manifest. IMAGE_OWNER is set (lowercased) by the
+# release workflow so images publish under whichever GitHub account runs the
+# release, e.g. ghcr.io/<owner>/kapso-whatsapp-bridge.
+dockers:
+  - id: bridge-amd64
+    ids:
+      - bridge
+    goos: linux
+    goarch: amd64
+    dockerfile: Dockerfile
+    use: buildx
+    image_templates:
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:{{ .Version }}-amd64"
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:latest-amd64"
+    build_flag_templates:
+      - "--platform=linux/amd64"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.IMAGE_OWNER }}/openclaw-kapso-whatsapp"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+
+  - id: bridge-arm64
+    ids:
+      - bridge
+    goos: linux
+    goarch: arm64
+    dockerfile: Dockerfile
+    use: buildx
+    image_templates:
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:{{ .Version }}-arm64"
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:latest-arm64"
+    build_flag_templates:
+      - "--platform=linux/arm64"
+      - "--label=org.opencontainers.image.source=https://github.com/{{ .Env.IMAGE_OWNER }}/openclaw-kapso-whatsapp"
+      - "--label=org.opencontainers.image.version={{ .Version }}"
+      - "--label=org.opencontainers.image.revision={{ .FullCommit }}"
+
+docker_manifests:
+  - name_template: "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:{{ .Version }}"
+    image_templates:
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:{{ .Version }}-amd64"
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:{{ .Version }}-arm64"
+  - name_template: "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:latest"
+    image_templates:
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:latest-amd64"
+      - "ghcr.io/{{ .Env.IMAGE_OWNER }}/kapso-whatsapp-bridge:latest-arm64"
