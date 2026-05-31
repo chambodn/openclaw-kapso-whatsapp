@@ -39,7 +39,7 @@ func (p *Poller) Run(ctx context.Context, out chan<- delivery.Event) error {
 	}
 
 	// Poll immediately, then on interval.
-	p.poll(&lastPoll, out)
+	p.poll(ctx, &lastPoll, out)
 
 	ticker := time.NewTicker(p.Interval)
 	defer ticker.Stop()
@@ -49,7 +49,7 @@ func (p *Poller) Run(ctx context.Context, out chan<- delivery.Event) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			p.poll(&lastPoll, out)
+			p.poll(ctx, &lastPoll, out)
 		}
 	}
 }
@@ -64,7 +64,7 @@ func (p *Poller) Run(ctx context.Context, out chan<- delivery.Event) error {
 // by the `since` filter.
 const maxPollPages = 100
 
-func (p *Poller) poll(lastPoll *time.Time, out chan<- delivery.Event) {
+func (p *Poller) poll(ctx context.Context, lastPoll *time.Time, out chan<- delivery.Event) {
 	since := lastPoll.Format(time.RFC3339)
 
 	var newest time.Time
@@ -72,7 +72,7 @@ func (p *Poller) poll(lastPoll *time.Time, out chan<- delivery.Event) {
 	after := ""
 
 	for page := 0; page < maxPollPages; page++ {
-		resp, err := p.Client.ListMessages(kapso.ListMessagesParams{
+		resp, err := p.Client.ListMessages(ctx, kapso.ListMessagesParams{
 			Direction: "inbound",
 			Since:     since,
 			Limit:     100,
@@ -93,7 +93,7 @@ func (p *Poller) poll(lastPoll *time.Time, out chan<- delivery.Event) {
 				newest = msgTime
 			}
 
-			text, ok := delivery.ExtractText(msg.Message, p.Client, p.Transcriber, p.MaxAudioSize)
+			text, ok := delivery.ExtractText(ctx, msg.Message, p.Client, p.Transcriber, p.MaxAudioSize)
 			if !ok {
 				continue
 			}

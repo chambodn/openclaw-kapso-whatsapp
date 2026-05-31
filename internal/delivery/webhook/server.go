@@ -31,11 +31,26 @@ type Server struct {
 	Client       *kapso.Client
 	Transcriber  transcribe.Transcriber // nil = transcription disabled
 	MaxAudioSize int64
+
+	// baseCtx is the daemon-lifetime context captured in Run. Downstream
+	// processing (transcription, media download) is bound to it rather than the
+	// per-request context, which is already done once the 200 ack is written.
+	baseCtx context.Context
+}
+
+// processCtx returns the daemon-lifetime context, or Background when the server
+// is exercised directly in tests without Run.
+func (s *Server) processCtx() context.Context {
+	if s.baseCtx != nil {
+		return s.baseCtx
+	}
+	return context.Background()
 }
 
 // Run starts the webhook HTTP server and emits events on out. It blocks until
 // ctx is cancelled, at which point the server is gracefully shut down.
 func (s *Server) Run(ctx context.Context, out chan<- delivery.Event) error {
+	s.baseCtx = ctx
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", s.webhookHandler(out))
 	mux.HandleFunc("/health", handleHealth)
@@ -236,7 +251,7 @@ func (s *Server) handleKapsoPayload(body []byte, out chan<- delivery.Event) {
 // emitMessage extracts text from a message and emits it as a delivery.Event.
 // contacts is an optional Meta-format contact-name lookup (nil for Kapso native).
 func (s *Server) emitMessage(msg kapso.Message, contacts map[string]string, out chan<- delivery.Event) {
-	text, ok := delivery.ExtractText(msg, s.Client, s.Transcriber, s.MaxAudioSize)
+	text, ok := delivery.ExtractText(s.processCtx(), msg, s.Client, s.Transcriber, s.MaxAudioSize)
 	if !ok {
 		return
 	}

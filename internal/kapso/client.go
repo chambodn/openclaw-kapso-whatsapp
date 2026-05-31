@@ -2,6 +2,7 @@ package kapso
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -44,7 +45,7 @@ func NewClient(apiKey, phoneNumberID string) *Client {
 }
 
 // SendText sends a text message to the given phone number.
-func (c *Client) SendText(to, text string) (*SendMessageResponse, error) {
+func (c *Client) SendText(ctx context.Context, to, text string) (*SendMessageResponse, error) {
 	req := SendMessageRequest{
 		MessagingProduct: "whatsapp",
 		RecipientType:    "individual",
@@ -59,7 +60,7 @@ func (c *Client) SendText(to, text string) (*SendMessageResponse, error) {
 	}
 
 	url := fmt.Sprintf("%s/%s/messages", c.getBaseURL(), c.PhoneNumberID)
-	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}
@@ -91,17 +92,17 @@ func (c *Client) SendText(to, text string) (*SendMessageResponse, error) {
 }
 
 // MarkRead marks a message as read. This sends blue checkmarks to the sender.
-func (c *Client) MarkRead(messageID string) error {
-	return c.markRead(messageID, nil)
+func (c *Client) MarkRead(ctx context.Context, messageID string) error {
+	return c.markRead(ctx, messageID, nil)
 }
 
 // MarkReadWithTyping marks a message as read and shows a typing indicator.
-func (c *Client) MarkReadWithTyping(messageID string) error {
-	return c.markRead(messageID, &TypingIndicator{Type: "text"})
+func (c *Client) MarkReadWithTyping(ctx context.Context, messageID string) error {
+	return c.markRead(ctx, messageID, &TypingIndicator{Type: "text"})
 }
 
 // markRead posts a mark-as-read request, optionally with a typing indicator.
-func (c *Client) markRead(messageID string, typing *TypingIndicator) error {
+func (c *Client) markRead(ctx context.Context, messageID string, typing *TypingIndicator) error {
 	req := MarkReadRequest{
 		MessagingProduct: "whatsapp",
 		Status:           "read",
@@ -115,7 +116,7 @@ func (c *Client) markRead(messageID string, typing *TypingIndicator) error {
 	}
 
 	url := fmt.Sprintf("%s/%s/messages", c.getBaseURL(), c.PhoneNumberID)
-	httpReq, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
@@ -142,7 +143,7 @@ func (c *Client) markRead(messageID string, typing *TypingIndicator) error {
 // maximum response size. The maxBytes limit is applied via io.LimitReader with
 // a +1 sentinel: if the server sends more than maxBytes, an error is returned.
 // Only HTTPS URLs with allowed hostnames are accepted to prevent SSRF.
-func (c *Client) DownloadMedia(rawURL string, maxBytes int64) ([]byte, error) {
+func (c *Client) DownloadMedia(ctx context.Context, rawURL string, maxBytes int64) ([]byte, error) {
 	safeURL, err := sanitizeMediaURL(rawURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid media URL: %w", err)
@@ -150,7 +151,7 @@ func (c *Client) DownloadMedia(rawURL string, maxBytes int64) ([]byte, error) {
 
 	// Use the reconstructed URL (safeURL.String()) instead of the raw input
 	// to break the taint chain for static analysis (CodeQL go/request-forgery).
-	req, err := http.NewRequest("GET", safeURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", safeURL.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

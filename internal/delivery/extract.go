@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/kapso"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/transcribe"
@@ -19,7 +20,7 @@ import (
 //  1. Server-side transcript from Kapso (msg.Kapso.Transcript.Text)
 //  2. Local transcription via tr (download from msg.Kapso.MediaURL)
 //  3. Fallback to "[audio] (mime)" format
-func ExtractText(msg kapso.Message, client *kapso.Client, tr transcribe.Transcriber, maxAudioSize int64) (string, bool) {
+func ExtractText(ctx context.Context, msg kapso.Message, client *kapso.Client, tr transcribe.Transcriber, maxAudioSize int64) (string, bool) {
 	switch msg.Type {
 	case "text":
 		if msg.Text == nil {
@@ -55,8 +56,8 @@ func ExtractText(msg kapso.Message, client *kapso.Client, tr transcribe.Transcri
 		if tr != nil {
 			mediaURL := kapsoMediaURL(msg.Kapso)
 			if mediaURL != "" {
-				if audio, err := client.DownloadMedia(mediaURL, maxAudioSize); err == nil {
-					if text, err := tr.Transcribe(context.Background(), audio, msg.Audio.MimeType); err == nil {
+				if audio, err := client.DownloadMedia(ctx, mediaURL, maxAudioSize); err == nil {
+					if text, err := tr.Transcribe(ctx, audio, msg.Audio.MimeType); err == nil {
 						return "[voice] " + text, true
 					} else {
 						log.Printf("WARN: transcription failed for message %s: %v", msg.ID, err)
@@ -132,14 +133,19 @@ func formatLocationMessage(loc *kapso.LocationContent) string {
 }
 
 // notifyUnsupported sends a WhatsApp reply informing the user that their
-// message type is not yet supported.
+// message type is not yet supported. It runs in a detached goroutine, so it
+// uses its own bounded context rather than the caller's (which may already be
+// done by the time this runs).
 func notifyUnsupported(from, msgType string, client *kapso.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	to := from
 	if !strings.HasPrefix(to, "+") {
 		to = "+" + to
 	}
 	reply := fmt.Sprintf("Sorry, I can't process %s messages yet. Please send text instead.", msgType)
-	if _, err := client.SendText(to, reply); err != nil {
+	if _, err := client.SendText(ctx, to, reply); err != nil {
 		log.Printf("failed to send unsupported-type notice to %s: %v", to, err)
 	}
 }

@@ -1,6 +1,7 @@
 package poller
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -54,7 +55,7 @@ func TestPollFollowsPaginationCursor(t *testing.T) {
 
 	out := make(chan delivery.Event, 10)
 	lastPoll := time.Unix(0, 0).UTC()
-	p.poll(&lastPoll, out)
+	p.poll(context.Background(), &lastPoll, out)
 	close(out)
 
 	var ids []string
@@ -94,7 +95,7 @@ func TestPollSinglePageNoCursor(t *testing.T) {
 
 	out := make(chan delivery.Event, 4)
 	lastPoll := time.Unix(0, 0).UTC()
-	p.poll(&lastPoll, out)
+	p.poll(context.Background(), &lastPoll, out)
 	close(out)
 
 	var ids []string

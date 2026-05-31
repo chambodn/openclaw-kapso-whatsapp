@@ -1,13 +1,16 @@
 package kapso
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // rewriteTransport rewrites all request URLs to point at the test server.
@@ -45,7 +48,7 @@ func TestMarkRead(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		err := client.MarkRead("wamid.abc123")
+		err := client.MarkRead(context.Background(), "wamid.abc123")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -87,7 +90,7 @@ func TestMarkRead(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		err := client.MarkRead("wamid.abc123")
+		err := client.MarkRead(context.Background(), "wamid.abc123")
 		if err == nil {
 			t.Fatal("expected error, got nil")
 		}
@@ -117,7 +120,7 @@ func TestMarkReadWithTyping(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		err := client.MarkReadWithTyping("wamid.abc123")
+		err := client.MarkReadWithTyping(context.Background(), "wamid.abc123")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -193,7 +196,7 @@ func TestDownloadMedia(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		got, err := client.DownloadMedia(allowedURL, int64(len(body)+100))
+		got, err := client.DownloadMedia(context.Background(), allowedURL, int64(len(body)+100))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -216,7 +219,7 @@ func TestDownloadMedia(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		got, err := client.DownloadMedia(allowedURL, int64(len(body)))
+		got, err := client.DownloadMedia(context.Background(), allowedURL, int64(len(body)))
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -244,7 +247,7 @@ func TestDownloadMedia(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		_, err := client.DownloadMedia(allowedURL, maxBytes)
+		_, err := client.DownloadMedia(context.Background(), allowedURL, maxBytes)
 		if err == nil {
 			t.Fatal("expected size limit error, got nil")
 		}
@@ -269,7 +272,7 @@ func TestDownloadMedia(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		_, err := client.DownloadMedia(allowedURL, 1024)
+		_, err := client.DownloadMedia(context.Background(), allowedURL, 1024)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -291,7 +294,7 @@ func TestDownloadMedia(t *testing.T) {
 			HTTPClient:    &http.Client{Transport: &rewriteTransport{base: srv.URL, wrapped: http.DefaultTransport}},
 		}
 
-		_, err := client.DownloadMedia(allowedURL, 1024)
+		_, err := client.DownloadMedia(context.Background(), allowedURL, 1024)
 		if err == nil {
 			t.Fatal("expected error for non-200 status, got nil")
 		}
@@ -307,7 +310,7 @@ func TestDownloadMedia(t *testing.T) {
 			HTTPClient:    http.DefaultClient,
 		}
 
-		_, err := client.DownloadMedia("https://evil.example.com/steal", 1024)
+		_, err := client.DownloadMedia(context.Background(), "https://evil.example.com/steal", 1024)
 		if err == nil {
 			t.Fatal("expected error for disallowed URL, got nil")
 		}
@@ -315,4 +318,30 @@ func TestDownloadMedia(t *testing.T) {
 			t.Errorf("error %q does not mention allowed list", err.Error())
 		}
 	})
+}
+
+// TestContextCancellationAbortsRequest verifies a cancelled context aborts an
+// in-flight Kapso request instead of blocking until the HTTP timeout.
+func TestContextCancellationAbortsRequest(t *testing.T) {
+	// Server that never responds until the client disconnects.
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	client := &Client{APIKey: "k", PhoneNumberID: "p", BaseURL: srv.URL, HTTPClient: srv.Client()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		cancel()
+	}()
+
+	_, err := client.ListMessages(ctx, ListMessagesParams{Limit: 1})
+	if err == nil {
+		t.Fatal("expected an error when the context is cancelled mid-request")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("expected context.Canceled in error chain, got %v", err)
+	}
 }
