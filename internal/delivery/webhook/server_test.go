@@ -122,6 +122,42 @@ func newTestServer() *Server {
 	}
 }
 
+// TestHandleVerification covers the Meta GET verification handshake, including
+// the constant-time verify-token comparison.
+func TestHandleVerification(t *testing.T) {
+	srv := newTestServer()
+	srv.VerifyToken = "secret-token"
+
+	tests := []struct {
+		name       string
+		mode       string
+		token      string
+		wantStatus int
+		wantBody   string
+	}{
+		{"correct token", "subscribe", "secret-token", http.StatusOK, "challenge-123"},
+		{"wrong token", "subscribe", "wrong-token", http.StatusForbidden, ""},
+		{"wrong mode", "unsubscribe", "secret-token", http.StatusForbidden, ""},
+		{"empty token", "subscribe", "", http.StatusForbidden, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			url := "/webhook?hub.mode=" + tc.mode + "&hub.verify_token=" + tc.token + "&hub.challenge=challenge-123"
+			req := httptest.NewRequest(http.MethodGet, url, nil)
+			w := httptest.NewRecorder()
+
+			srv.handleVerification(w, req)
+
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+			if tc.wantBody != "" && w.Body.String() != tc.wantBody {
+				t.Errorf("body = %q, want %q", w.Body.String(), tc.wantBody)
+			}
+		})
+	}
+}
+
 func TestHandleEvent_KapsoFormat(t *testing.T) {
 	payload := kapso.KapsoWebhookPayload{
 		Type: "whatsapp.message.received",

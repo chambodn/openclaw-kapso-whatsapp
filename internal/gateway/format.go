@@ -3,6 +3,7 @@ package gateway
 import (
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 // Compiled regexes for mdToWhatsApp compiled once at startup.
@@ -73,8 +74,14 @@ func SplitMessage(text string, maxLen int) []string {
 			continue
 		}
 
-		chunks = append(chunks, strings.TrimSpace(text[:maxLen]))
-		text = strings.TrimSpace(text[maxLen:])
+		// No separator found within range — hard-cut at maxLen, but back off to
+		// the nearest UTF-8 rune boundary so a multi-byte rune is never split.
+		cut := maxLen
+		for cut > 0 && !utf8.RuneStart(text[cut]) {
+			cut--
+		}
+		chunks = append(chunks, strings.TrimSpace(text[:cut]))
+		text = strings.TrimSpace(text[cut:])
 	}
 
 	if text != "" {

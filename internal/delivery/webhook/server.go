@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/hmac"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -86,7 +87,11 @@ func (s *Server) handleVerification(w http.ResponseWriter, r *http.Request) {
 	token := r.URL.Query().Get("hub.verify_token")
 	challenge := r.URL.Query().Get("hub.challenge")
 
-	if mode == "subscribe" && token == s.VerifyToken {
+	// Constant-time compare so a network attacker cannot recover the verify
+	// token byte-by-byte from response-timing differences.
+	tokenMatch := subtle.ConstantTimeCompare([]byte(token), []byte(s.VerifyToken)) == 1
+
+	if mode == "subscribe" && tokenMatch {
 		log.Printf("webhook verification successful")
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
@@ -94,7 +99,7 @@ func (s *Server) handleVerification(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("webhook verification failed: mode=%q token_match=%v", mode, token == s.VerifyToken)
+	log.Printf("webhook verification failed: mode=%q token_match=%v", mode, tokenMatch)
 	http.Error(w, "verification failed", http.StatusForbidden)
 }
 
