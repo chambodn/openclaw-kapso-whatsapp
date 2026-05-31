@@ -159,6 +159,21 @@ func main() {
 		log.Printf("commands: prefix=%q, %d command(s) configured", cfg.Commands.Prefix, len(cfg.Commands.Definitions))
 	}
 
+	// Bound the number of concurrently in-flight message handlers. Without this
+	// a burst (e.g. the poller catching up with a backlog after downtime) would
+	// spawn one long-lived goroutine per message, each holding a 10-minute
+	// timeout and a typing ticker. Acquiring a slot before spawning applies
+	// backpressure up through the consume loop to the sources.
+	const maxInFlight = 16
+	sem := make(chan struct{}, maxInFlight)
+	spawn := func(fn func()) {
+		sem <- struct{}{}
+		go func() {
+			defer func() { <-sem }()
+			fn()
+		}()
+	}
+
 	// Consume loop — identical for all sources. Each event is dispatched inside
 	// a closure with its own panic recovery so one bad event is logged and
 	// skipped rather than killing the loop and silently halting all delivery.
@@ -187,12 +202,12 @@ func main() {
 
 			// Bridge commands are intercepted before the gateway.
 			if dispatcher.IsCommand(evt.Text) {
-				go handleCommand(ctx, dispatcher, gw, client, evt, sessionKey, role)
+				spawn(func() { handleCommand(ctx, dispatcher, gw, client, evt, sessionKey, role) })
 				return
 			}
 
 			// Forward to gateway and wait for agent reply in a goroutine.
-			go handleMessage(ctx, gw, client, evt, sessionKey, role, cfg.Gateway.ErrorMessage)
+			spawn(func() { handleMessage(ctx, gw, client, evt, sessionKey, role, cfg.Gateway.ErrorMessage) })
 		}
 		for evt := range events {
 			dispatch(evt)

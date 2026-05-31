@@ -109,7 +109,7 @@ func New(cfg config.TranscribeConfig) (Transcriber, error) {
 
 	// Wrap all cloud providers with retry logic.
 	// Composition: cache(retry(provider)) — cache is outermost so a cache hit
-	// short-circuits both retry and provider call (RESEARCH.md Pitfall 2).
+	// short-circuits both the retry machinery and the provider call.
 	timeout := time.Duration(cfg.Timeout) * time.Second
 	wrapped := newRetryTranscriber(p, timeout)
 	if cfg.CacheTTL > 0 {
