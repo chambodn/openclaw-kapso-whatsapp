@@ -8,9 +8,15 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 const baseURL = "https://api.kapso.ai/meta/whatsapp/v24.0"
+
+// defaultHTTPTimeout bounds every Kapso API call. Without it the client would
+// use http.DefaultClient (no timeout), so a slow or hung Kapso endpoint could
+// block the poll loop and per-message handler goroutines indefinitely.
+const defaultHTTPTimeout = 30 * time.Second
 
 // Client sends messages via the Kapso WhatsApp API.
 type Client struct {
@@ -33,7 +39,7 @@ func NewClient(apiKey, phoneNumberID string) *Client {
 	return &Client{
 		APIKey:        apiKey,
 		PhoneNumberID: phoneNumberID,
-		HTTPClient:    http.DefaultClient,
+		HTTPClient:    &http.Client{Timeout: defaultHTTPTimeout},
 	}
 }
 
