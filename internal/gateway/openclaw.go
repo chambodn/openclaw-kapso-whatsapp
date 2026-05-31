@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,6 +18,11 @@ import (
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/gorilla/websocket"
 )
+
+// errPermanent marks a connect failure that retrying cannot fix (e.g. the
+// gateway rejected the auth handshake), so the supervisor must stop reconnecting
+// rather than loop forever.
+var errPermanent = errors.New("gateway connect permanently rejected")
 
 // OpenClaw protocol types.
 
@@ -153,25 +159,44 @@ type OpenClaw struct {
 
 	autoReconnect bool // reconnect on drop; true via the production constructors
 
-	mu        sync.Mutex    // guards cur and closing
-	cur       *connSession  // current connection; nil before connect / mid-reconnect
+	// initialBackoff is the first wait after a rapid drop; it doubles up to the
+	// 30s cap. Zero means the default of one second. Injectable so tests can use
+	// a tiny value rather than depending on real-time pacing (mirrors how
+	// pollInterval-style timings are injected elsewhere).
+	initialBackoff time.Duration
+
+	// startOnce guards the supervisor start so a second Connect call cannot spawn
+	// a second supervisor goroutine.
+	startOnce sync.Once
+
+	mu sync.Mutex // guards cur and closing
+	// cur is the current connection. It is nil before the first connect and
+	// during a reconnect window (cleared at the start of each reconnect attempt,
+	// re-set on success), so callers see a clean "not connected" state.
+	cur       *connSession
 	closing   chan struct{} // closed by Close to stop the supervisor
 	closeOnce sync.Once
+
+	// supervisorDone is closed when supervise() returns; only meaningful when
+	// autoReconnect is true (otherwise no supervisor is started and it stays
+	// open, so Close must not wait on it).
+	supervisorDone chan struct{}
 }
 
 // NewOpenClaw creates an OpenClaw gateway from config.
 func NewOpenClaw(cfg config.GatewayConfig) *OpenClaw {
 	return &OpenClaw{
-		url:           cfg.URL,
-		token:         cfg.Token,
-		sessionsJSON:  cfg.SessionsJSON,
-		sessionKey:    cfg.SessionKey,
-		role:          cfg.Role,
-		scopes:        cfg.Scopes,
-		tracker:       newReplyTracker(),
-		pollInterval:  3 * time.Second,
-		autoReconnect: true,
-		closing:       make(chan struct{}),
+		url:            cfg.URL,
+		token:          cfg.Token,
+		sessionsJSON:   cfg.SessionsJSON,
+		sessionKey:     cfg.SessionKey,
+		role:           cfg.Role,
+		scopes:         cfg.Scopes,
+		tracker:        newReplyTracker(),
+		pollInterval:   3 * time.Second,
+		autoReconnect:  true,
+		closing:        make(chan struct{}),
+		supervisorDone: make(chan struct{}),
 	}
 }
 
@@ -185,16 +210,25 @@ func NewOpenClawWithSigner(cfg config.GatewayConfig, signer Signer) *OpenClaw {
 // Connect establishes the first connection and, in production, starts the
 // supervisor that reconnects on drops.
 func (oc *OpenClaw) Connect(ctx context.Context) error {
+	// Reject a second Connect: a live session already exists, and starting a
+	// second supervisor (or replacing oc.cur) would orphan the first session and
+	// its loops.
+	oc.mu.Lock()
+	already := oc.cur != nil
+	oc.mu.Unlock()
+	if already {
+		return fmt.Errorf("already connected to gateway")
+	}
+
 	if err := oc.connectOnce(ctx); err != nil {
 		return err
 	}
 	if oc.autoReconnect {
-		oc.mu.Lock()
-		if oc.closing == nil {
-			oc.closing = make(chan struct{})
-		}
-		oc.mu.Unlock()
-		go oc.supervise(ctx)
+		// startOnce ensures only the first successful Connect spawns a
+		// supervisor, so supervisorDone is closed exactly once.
+		oc.startOnce.Do(func() {
+			go oc.supervise(ctx)
+		})
 	}
 	return nil
 }
@@ -203,6 +237,13 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 // handshake, then installs the resulting connSession and starts its read/ping
 // loops. It is called for the initial connect and for every reconnect.
 func (oc *OpenClaw) connectOnce(ctx context.Context) error {
+	// Clear cur for the (re)connect window: during it sendRequest returns the
+	// clean "not connected to gateway" error rather than racing on a
+	// soon-to-be-closed conn, and Close sees nil.
+	oc.mu.Lock()
+	oc.cur = nil
+	oc.mu.Unlock()
+
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
@@ -326,7 +367,7 @@ func (oc *OpenClaw) connectOnce(ctx context.Context) error {
 
 	if resp.Error != nil {
 		_ = conn.Close()
-		return fmt.Errorf("connect rejected: %s", string(resp.Error))
+		return fmt.Errorf("connect rejected: %s: %w", string(resp.Error), errPermanent)
 	}
 
 	// Keepalive: bound reads so a half-open connection cannot hang readLoop
@@ -344,6 +385,16 @@ func (oc *OpenClaw) connectOnce(ctx context.Context) error {
 	})
 
 	oc.mu.Lock()
+	// If Close has already been requested, don't publish this session or start
+	// its loops; tear it down instead so Close can't race a freshly-installed
+	// connection it will never observe.
+	select {
+	case <-oc.closing:
+		oc.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("gateway closing")
+	default:
+	}
 	oc.cur = cs
 	oc.mu.Unlock()
 	go oc.pingLoop(cs)
@@ -358,7 +409,42 @@ func (oc *OpenClaw) connectOnce(ctx context.Context) error {
 // autoReconnect is set (the production constructors). Each iteration waits for
 // the current session's readLoop to exit, then reconnects with backoff.
 func (oc *OpenClaw) supervise(ctx context.Context) {
+	// supervisorDone closes on every return path so Close can wait for the
+	// supervisor to exit. Registered before safe.Recover so (LIFO ordering) it
+	// runs after the panic handler — Close only unblocks once a panic, if any,
+	// has been handled.
+	defer close(oc.supervisorDone)
 	defer safe.Recover("openclaw supervise")
+
+	// On any exit, tear down the live socket so its readLoop errors out and both
+	// loops (read + ping) exit. Without this, cancelling ctx would stop the
+	// supervisor but leave the conn and its loops running. Closing a websocket
+	// conn twice is safe (it just returns an error), so this is fine even when
+	// Close() also closed the conn.
+	defer func() {
+		oc.mu.Lock()
+		cs := oc.cur
+		oc.cur = nil
+		oc.mu.Unlock()
+		if cs != nil {
+			_ = cs.conn.Close()
+		}
+	}()
+
+	// initialBackoff is the first wait after a rapid drop; it doubles up to
+	// maxBackoff. stableThreshold is how long a connection must stay up to be
+	// considered healthy: a connection that drops sooner is treated as a failed
+	// attempt so we pace (rather than busy-spin on) connect-drop-connect cycles.
+	const (
+		maxBackoff      = 30 * time.Second
+		stableThreshold = 5 * time.Second
+	)
+	initialBackoff := oc.initialBackoff
+	if initialBackoff <= 0 {
+		initialBackoff = time.Second
+	}
+	backoff := initialBackoff
+
 	for {
 		oc.mu.Lock()
 		cs := oc.cur
@@ -367,6 +453,7 @@ func (oc *OpenClaw) supervise(ctx context.Context) {
 			return
 		}
 
+		established := time.Now()
 		select {
 		case <-ctx.Done():
 			return
@@ -384,8 +471,27 @@ func (oc *OpenClaw) supervise(ctx context.Context) {
 		default:
 		}
 
-		log.Printf("openclaw: gateway connection lost, reconnecting...")
-		if !oc.reconnect(ctx) {
+		if uptime := time.Since(established); uptime >= stableThreshold {
+			// Connection was healthy long enough; reset backoff.
+			backoff = initialBackoff
+			log.Printf("openclaw: gateway connection lost after %s, reconnecting...", uptime.Round(time.Millisecond))
+		} else {
+			// Rapid drop: pace the next attempt so we don't spin at zero delay.
+			log.Printf("openclaw: gateway connection dropped after %s, backing off %s before reconnecting", uptime.Round(time.Millisecond), backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-oc.closing:
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		if !oc.reconnect(ctx, &backoff, maxBackoff) {
 			return
 		}
 		log.Printf("openclaw: reconnected to gateway")
@@ -393,26 +499,31 @@ func (oc *OpenClaw) supervise(ctx context.Context) {
 }
 
 // reconnect retries connectOnce with exponential backoff until it succeeds or
-// the daemon is shutting down. Returns false if it stopped without connecting.
-func (oc *OpenClaw) reconnect(ctx context.Context) bool {
-	const maxBackoff = 30 * time.Second
-	backoff := time.Second
+// the daemon is shutting down. It shares the supervisor's backoff value so a
+// rapid connect-drop-connect cycle keeps escalating rather than resetting. A
+// permanent failure (errPermanent) stops the retry loop. Returns false if it
+// stopped without connecting.
+func (oc *OpenClaw) reconnect(ctx context.Context, backoff *time.Duration, maxBackoff time.Duration) bool {
 	for {
-		if err := oc.connectOnce(ctx); err == nil {
+		err := oc.connectOnce(ctx)
+		if err == nil {
 			return true
-		} else {
-			log.Printf("openclaw: reconnect attempt failed: %v (retrying in %s)", err, backoff)
 		}
+		if errors.Is(err, errPermanent) {
+			log.Printf("openclaw: reconnect aborted, permanent failure: %v", err)
+			return false
+		}
+		log.Printf("openclaw: reconnect attempt failed: %v (retrying in %s)", err, *backoff)
 		select {
 		case <-ctx.Done():
 			return false
 		case <-oc.closing:
 			return false
-		case <-time.After(backoff):
+		case <-time.After(*backoff):
 		}
-		backoff *= 2
-		if backoff > maxBackoff {
-			backoff = maxBackoff
+		*backoff *= 2
+		if *backoff > maxBackoff {
+			*backoff = maxBackoff
 		}
 	}
 }
@@ -499,10 +610,92 @@ func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params inter
 	oc.mu.Lock()
 	cs := oc.cur
 	oc.mu.Unlock()
+
+	// If we're mid-reconnect (cur momentarily nil), wait for a fresh session
+	// rather than failing immediately. Fails fast if we're shutting down.
 	if cs == nil {
-		return responseFrame{}, fmt.Errorf("not connected to gateway")
+		var err error
+		cs, err = oc.waitForSession(ctx, nil)
+		if err != nil {
+			return responseFrame{}, err
+		}
 	}
 
+	resp, err := oc.sendOnSession(ctx, cs, method, params)
+	if err == nil {
+		return resp, nil
+	}
+	// Only the bound-to-a-dead-session error is retryable: the write/connection
+	// failed because the session dropped during a reconnect. ctx errors and
+	// shutdown are terminal and already returned by sendOnSession as-is.
+	if !errors.Is(err, errSessionGone) {
+		return responseFrame{}, err
+	}
+
+	// Retrying on a fresh session only makes sense when a supervisor exists to
+	// publish one. Without autoReconnect, no new session will ever appear, so
+	// waiting would block forever (the ctx here may have no deadline). Return the
+	// errSessionGone-wrapped error immediately, preserving the contract that a
+	// dropped connection unblocks in-flight callers.
+	if !oc.autoReconnect {
+		return responseFrame{}, err
+	}
+
+	// Wait for a *new* live session (different generation) and retry once.
+	fresh, werr := oc.waitForSession(ctx, cs)
+	if werr != nil {
+		return responseFrame{}, werr
+	}
+	return oc.sendOnSession(ctx, fresh, method, params)
+}
+
+// errSessionGone marks a sendRequest failure caused by the bound session
+// dropping (write failed or its done channel closed). It is retryable on a
+// fresh session, unlike ctx cancellation or shutdown.
+var errSessionGone = errors.New("gateway session gone")
+
+// waitForSession blocks until oc.cur is a live session distinct from prev
+// (pass nil to accept any session). It returns fast if the gateway is shutting
+// down and respects the caller's ctx. It polls because reconnects publish a new
+// session without a dedicated signal; the poll is cheap and ctx-bounded.
+func (oc *OpenClaw) waitForSession(ctx context.Context, prev *connSession) (*connSession, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		oc.mu.Lock()
+		cs := oc.cur
+		closing := oc.closing
+		oc.mu.Unlock()
+		if cs != nil && cs != prev {
+			return cs, nil
+		}
+
+		// Guard against a nil closing channel: receiving from nil blocks forever,
+		// which would make this select uncancellable via the closing path. ctx and
+		// the ticker still apply, so the loop remains bounded regardless.
+		if closing == nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-ticker.C:
+			}
+			continue
+		}
+
+		select {
+		case <-closing:
+			return nil, fmt.Errorf("not connected to gateway")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// sendOnSession sends one request on a specific session and waits for its
+// response. It returns errSessionGone (wrapped) if the write fails or the
+// session drops while waiting, so the caller can retry on a fresh session.
+func (oc *OpenClaw) sendOnSession(ctx context.Context, cs *connSession, method string, params interface{}) (responseFrame, error) {
 	id := cs.nextID()
 	req := requestFrame{
 		Type:   "req",
@@ -531,14 +724,14 @@ func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params inter
 		cs.pendMu.Lock()
 		delete(cs.pending, id)
 		cs.pendMu.Unlock()
-		return responseFrame{}, fmt.Errorf("send %s: %w", method, err)
+		return responseFrame{}, fmt.Errorf("send %s: %w: %w", method, err, errSessionGone)
 	}
 
 	// Wait for readLoop to deliver the response.
 	select {
 	case resp, ok := <-ch:
 		if !ok {
-			return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response", method)
+			return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response: %w", method, errSessionGone)
 		}
 		return resp, nil
 	case <-ctx.Done():
@@ -547,7 +740,7 @@ func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params inter
 		cs.pendMu.Unlock()
 		return responseFrame{}, ctx.Err()
 	case <-cs.done:
-		return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response", method)
+		return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response: %w", method, errSessionGone)
 	}
 }
 
@@ -648,13 +841,19 @@ func (oc *OpenClaw) Close() error {
 	oc.cur = nil
 	oc.mu.Unlock()
 
-	if cs == nil {
-		return nil
+	var err error
+	if cs != nil {
+		err = cs.conn.Close()
+		// Wait for readLoop to finish cleanup. The wait is bounded because
+		// conn.Close() causes ReadMessage() to return an error immediately.
+		<-cs.done
 	}
-	err := cs.conn.Close()
-	// Wait for readLoop to finish cleanup. The wait is bounded because
-	// conn.Close() causes ReadMessage() to return an error immediately.
-	<-cs.done
+	// Wait for the supervisor to exit so it can't install a new session after
+	// Close returns. Only autoReconnect starts a supervisor; otherwise
+	// supervisorDone is never closed and waiting here would hang.
+	if oc.autoReconnect {
+		<-oc.supervisorDone
+	}
 	return err
 }
 
