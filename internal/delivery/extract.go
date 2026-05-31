@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/kapso"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/phone"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/transcribe"
 )
 
@@ -140,10 +141,7 @@ func notifyUnsupported(from, msgType string, client *kapso.Client) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	to := from
-	if !strings.HasPrefix(to, "+") {
-		to = "+" + to
-	}
+	to := phone.EnsurePlus(from)
 	reply := fmt.Sprintf("Sorry, I can't process %s messages yet. Please send text instead.", msgType)
 	if _, err := client.SendText(ctx, to, reply); err != nil {
 		log.Printf("failed to send unsupported-type notice to %s: %v", to, err)

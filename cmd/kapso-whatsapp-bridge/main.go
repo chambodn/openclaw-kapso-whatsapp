@@ -20,6 +20,7 @@ import (
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/device"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/gateway"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/kapso"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/phone"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/security"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/tailscale"
@@ -225,10 +226,7 @@ func main() {
 // Commands are executed without involving the AI gateway (except agent-type commands).
 func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gateway, client *kapso.Client, evt delivery.Event, sessionKey, role string) {
 	defer safe.Recover("handleCommand")
-	from := evt.From
-	if !strings.HasPrefix(from, "+") {
-		from = "+" + from
-	}
+	from := phone.EnsurePlus(evt.From)
 
 	if err := client.MarkReadWithTyping(ctx, evt.ID); err != nil {
 		log.Printf("command: failed to mark read for %s: %v", evt.ID, err)
@@ -295,10 +293,7 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 // and sends it back to the WhatsApp sender.
 func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client, evt delivery.Event, sessionKey, role, errorMessage string) {
 	defer safe.Recover("handleMessage")
-	from := evt.From
-	if !strings.HasPrefix(from, "+") {
-		from = "+" + from
-	}
+	from := phone.EnsurePlus(evt.From)
 
 	// Show typing indicator.
 	if err := client.MarkReadWithTyping(ctx, evt.ID); err != nil {

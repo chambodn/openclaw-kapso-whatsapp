@@ -14,6 +14,14 @@ type Gateway interface {
 
 	// SendAndReceive sends a message and blocks until the agent's reply is
 	// available. The returned string is the raw agent response text.
+	//
+	// Implementations differ in which Request fields they use:
+	//   - OpenClaw: SessionKey (per-sender agent session) and IdempotencyKey
+	//     (gateway-side dedup); From/FromName/Role are tagged into the message.
+	//   - ZeroClaw: isolates by a per-sender connection and tags
+	//     From/FromName/Role into the message; SessionKey and IdempotencyKey are
+	//     not used (duplicate inbound deliveries are suppressed upstream by
+	//     delivery.Merge).
 	SendAndReceive(ctx context.Context, req *Request) (string, error)
 
 	// Close tears down the connection.

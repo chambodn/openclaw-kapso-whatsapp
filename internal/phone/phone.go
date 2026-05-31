@@ -22,3 +22,14 @@ func Normalize(s string) string {
 	}
 	return b.String()
 }
+
+// EnsurePlus returns s in E.164 form with a leading "+", adding one only when
+// it is absent. An empty string is returned unchanged. The Meta/WhatsApp
+// webhook delivers numbers without the leading +, but the Kapso send API
+// expects it.
+func EnsurePlus(s string) string {
+	if s == "" || strings.HasPrefix(s, "+") {
+		return s
+	}
+	return "+" + s
+}
