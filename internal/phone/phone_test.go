@@ -18,3 +18,17 @@ func TestNormalize(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsurePlus(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"15551234567", "+15551234567"},
+		{"+15551234567", "+15551234567"},
+		{"", ""},
+		{"+", "+"},
+	}
+	for _, tt := range tests {
+		if got := EnsurePlus(tt.in); got != tt.want {
+			t.Errorf("EnsurePlus(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}

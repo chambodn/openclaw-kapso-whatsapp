@@ -120,6 +120,8 @@ func TestZeroClawSendAndReceive(t *testing.T) {
 	}
 	defer func() { _ = zc.Close() }()
 
+	// From is left empty so this exercises the default probe connection (a
+	// non-empty From would open a second, dedicated connection).
 	reply, err := zc.SendAndReceive(context.Background(), &Request{
 		Text:           "Hi",
 		IdempotencyKey: "msg-1",
@@ -132,7 +134,7 @@ func TestZeroClawSendAndReceive(t *testing.T) {
 		t.Errorf("expected reply %q, got %q", "Hello world", reply)
 	}
 
-	// Verify the message sent to the server.
+	// Verify the message sent to the server is sender-tagged and carries the text.
 	raw := <-receivedMsg
 	var sent struct {
 		Type    string `json:"type"`
@@ -144,8 +146,8 @@ func TestZeroClawSendAndReceive(t *testing.T) {
 	if sent.Type != "message" {
 		t.Errorf("expected type 'message', got %q", sent.Type)
 	}
-	if sent.Content != "Hi" {
-		t.Errorf("expected content 'Hi', got %q", sent.Content)
+	if !strings.HasPrefix(sent.Content, "From:") || !strings.HasSuffix(sent.Content, "\nHi") {
+		t.Errorf("expected sender-tagged content ending in the text, got %q", sent.Content)
 	}
 }
 
@@ -271,9 +273,13 @@ func TestZeroClawSessionIsolation(t *testing.T) {
 			hist.messages = append(hist.messages, sent.Content)
 			hist.mu.Unlock()
 
-			// Echo back which connection handled it.
-			reply := fmt.Sprintf(`{"type":"done","full_response":"conn-%d: %s"}`, id, sent.Content)
-			_ = conn.WriteMessage(websocket.TextMessage, []byte(reply))
+			// Echo back which connection handled it. Marshal properly so a
+			// newline in the (sender-tagged) content yields valid JSON.
+			done, _ := json.Marshal(map[string]string{
+				"type":          "done",
+				"full_response": fmt.Sprintf("conn-%d: %s", id, sent.Content),
+			})
+			_ = conn.WriteMessage(websocket.TextMessage, done)
 		}
 	}))
 	defer srv.Close()

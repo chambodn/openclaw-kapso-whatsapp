@@ -94,10 +94,15 @@ func (zc *ZeroClaw) SendAndReceive(ctx context.Context, req *Request) (string, e
 		defer func() { _ = sc.conn.SetReadDeadline(time.Time{}) }()
 	}
 
-	// Send message — ZeroClaw takes raw text content.
+	// Send message. ZeroClaw isolates conversations by per-sender connection
+	// rather than by SessionKey, and its {type,content} frame has no field for
+	// idempotency, so SessionKey/IdempotencyKey are not used here (duplicate
+	// inbound deliveries are already suppressed upstream by delivery.Merge).
+	// Sender metadata is conveyed in the content, matching the OpenClaw tagging,
+	// so the agent still sees From/name/role.
 	msg := map[string]string{
 		"type":    "message",
-		"content": req.Text,
+		"content": fmt.Sprintf("From: %s (%s) [role: %s]\n%s", req.From, req.FromName, req.Role, req.Text),
 	}
 	data, err := json.Marshal(msg)
 	if err != nil {
