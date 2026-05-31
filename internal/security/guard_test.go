@@ -1,11 +1,48 @@
 package security
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
 )
+
+// TestGuardReapsExpiredBuckets verifies idle senders' rate-limit buckets are
+// swept rather than accumulating one map entry per sender forever.
+func TestGuardReapsExpiredBuckets(t *testing.T) {
+	cfg := testCfg()
+	cfg.Mode = "open" // allow any sender so buckets are created freely
+	cfg.RateWindow = 60
+	g := New(cfg)
+
+	clock := time.Unix(0, 0)
+	g.now = func() time.Time { return clock }
+	g.lastSweep = clock
+
+	for i := 0; i < 50; i++ {
+		g.Check(fmt.Sprintf("+1%09d", i))
+	}
+
+	g.mu.Lock()
+	created := len(g.buckets)
+	g.mu.Unlock()
+	if created != 50 {
+		t.Fatalf("expected 50 buckets created, got %d", created)
+	}
+
+	// Advance past the window + sweep interval; the next Check triggers a sweep
+	// that should reap all 50 now-expired buckets, leaving only the new sender.
+	clock = clock.Add(5 * time.Minute)
+	g.Check("+9999999999")
+
+	g.mu.Lock()
+	remaining := len(g.buckets)
+	g.mu.Unlock()
+	if remaining != 1 {
+		t.Fatalf("expected 1 bucket after sweep, got %d", remaining)
+	}
+}
 
 func testCfg() config.SecurityConfig {
 	return config.SecurityConfig{

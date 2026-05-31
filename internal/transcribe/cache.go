@@ -19,21 +19,28 @@ type cacheEntry struct {
 //
 // The mutex is released before calling the inner Transcriber to avoid holding
 // a lock during potentially long network calls (see RESEARCH.md Pitfall 1).
+// defaultCacheMaxEntries caps the number of cached transcripts so the map
+// cannot grow without bound as unique audio messages arrive. Each entry is a
+// hash key plus a short transcript, so this is a small memory ceiling.
+const defaultCacheMaxEntries = 1024
+
 type cacheTranscriber struct {
-	inner   Transcriber
-	ttl     time.Duration
-	nowFunc func() time.Time
-	mu      sync.Mutex
-	items   map[string]cacheEntry
+	inner      Transcriber
+	ttl        time.Duration
+	maxEntries int
+	nowFunc    func() time.Time
+	mu         sync.Mutex
+	items      map[string]cacheEntry
 }
 
 // newCacheTranscriber creates a cacheTranscriber wrapping inner with the given TTL.
 func newCacheTranscriber(inner Transcriber, ttl time.Duration) *cacheTranscriber {
 	return &cacheTranscriber{
-		inner:   inner,
-		ttl:     ttl,
-		nowFunc: time.Now,
-		items:   make(map[string]cacheEntry),
+		inner:      inner,
+		ttl:        ttl,
+		maxEntries: defaultCacheMaxEntries,
+		nowFunc:    time.Now,
+		items:      make(map[string]cacheEntry),
 	}
 }
 
@@ -69,8 +76,33 @@ func (c *cacheTranscriber) Transcribe(ctx context.Context, audio []byte, mimeTyp
 	// Store successful result.
 	expiry := c.nowFunc().Add(c.ttl)
 	c.mu.Lock()
+	c.evictLocked(c.nowFunc())
 	c.items[key] = cacheEntry{text: text, expiry: expiry}
 	c.mu.Unlock()
 
 	return text, nil
+}
+
+// evictLocked drops expired entries and, if the map is still at capacity,
+// evicts the entry closest to expiry. Callers must hold c.mu. The full scan is
+// negligible relative to the transcription network call that precedes a store.
+func (c *cacheTranscriber) evictLocked(now time.Time) {
+	for k, e := range c.items {
+		if !now.Before(e.expiry) {
+			delete(c.items, k)
+		}
+	}
+	if len(c.items) < c.maxEntries {
+		return
+	}
+	var oldestKey string
+	var oldestExpiry time.Time
+	for k, e := range c.items {
+		if oldestKey == "" || e.expiry.Before(oldestExpiry) {
+			oldestKey, oldestExpiry = k, e.expiry
+		}
+	}
+	if oldestKey != "" {
+		delete(c.items, oldestKey)
+	}
 }

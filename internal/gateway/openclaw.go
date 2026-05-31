@@ -8,6 +8,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -297,22 +298,65 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 		return fmt.Errorf("connect rejected: %s", string(resp.Error))
 	}
 
-	// Clear deadline for normal operation.
-	_ = conn.SetReadDeadline(time.Time{})
+	// Keepalive: bound reads so a half-open connection cannot hang readLoop
+	// (and every pending caller) indefinitely. The deadline is extended on any
+	// received frame and on pong replies; a ping is sent each pingPeriod.
+	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	conn.SetPongHandler(func(string) error {
+		return conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
 
 	// Initialize response routing for the new connection.
 	oc.pending = make(map[string]chan responseFrame)
 	oc.done = make(chan struct{})
+	go oc.pingLoop(conn, oc.done)
 	go oc.readLoop()
 
 	log.Printf("authenticated with gateway at %s", oc.url)
 	return nil
 }
 
+// WebSocket keepalive timings. A ping is sent every pingPeriod; the read side
+// must see a frame (data or pong) within pongWait or the read fails, freeing
+// any callers blocked on a half-open connection. pingPeriod < pongWait.
+const (
+	pongWait   = 90 * time.Second
+	pingPeriod = 54 * time.Second
+)
+
+// pingLoop sends a periodic WebSocket ping so an idle-but-healthy connection
+// stays alive and a dead one is detected within pongWait. WriteControl is
+// safe to call concurrently with the writes in sendRequest. It exits when the
+// connection's done channel is closed (i.e. readLoop has returned).
+func (oc *OpenClaw) pingLoop(conn *websocket.Conn, done chan struct{}) {
+	defer recoverGoroutine("openclaw pingLoop")
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-ticker.C:
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+				return
+			}
+		}
+	}
+}
+
+// recoverGoroutine logs and swallows a panic so a single bad frame cannot crash
+// the daemon via one of this package's long-lived goroutines.
+func recoverGoroutine(label string) {
+	if r := recover(); r != nil {
+		log.Printf("recovered panic in %s: %v\n%s", label, r, debug.Stack())
+	}
+}
+
 // readLoop reads incoming frames and routes "res" frames to pending callers.
 // All other frames (events) are logged for observability. This is the sole
 // goroutine that reads from the WebSocket connection.
 func (oc *OpenClaw) readLoop() {
+	defer recoverGoroutine("openclaw readLoop")
 	defer func() {
 		// Signal all pending sendRequest callers that the connection is gone.
 		oc.pendMu.Lock()
@@ -336,6 +380,8 @@ func (oc *OpenClaw) readLoop() {
 		if err != nil {
 			return
 		}
+		// Any traffic proves the connection is alive — extend the deadline.
+		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var frame responseFrame
 		if err := json.Unmarshal(msg, &frame); err != nil {

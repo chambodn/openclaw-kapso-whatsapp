@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"syscall"
 	"time"
@@ -152,6 +153,7 @@ func main() {
 
 	// Consume loop — identical for all sources.
 	go func() {
+		defer recoverGoroutine("consume loop")
 		for evt := range events {
 			verdict := guard.Check(evt.From)
 			switch verdict {
@@ -189,9 +191,18 @@ func main() {
 	cleanupFunnel(funnelProc)
 }
 
+// recoverGoroutine logs and swallows a panic so one bad message or handler
+// cannot crash the entire daemon. Deferred at the top of every goroutine.
+func recoverGoroutine(label string) {
+	if r := recover(); r != nil {
+		log.Printf("recovered panic in %s: %v\n%s", label, r, debug.Stack())
+	}
+}
+
 // handleCommand dispatches a bridge-level command and sends the reply to WhatsApp.
 // Commands are executed without involving the AI gateway (except agent-type commands).
 func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gateway, client *kapso.Client, evt delivery.Event, sessionKey, role string) {
+	defer recoverGoroutine("handleCommand")
 	from := evt.From
 	if !strings.HasPrefix(from, "+") {
 		from = "+" + from
@@ -261,6 +272,7 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 // handleMessage sends a message to the gateway, waits for the agent's reply,
 // and sends it back to the WhatsApp sender.
 func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client, evt delivery.Event, sessionKey, role, errorMessage string) {
+	defer recoverGoroutine("handleMessage")
 	from := evt.From
 	if !strings.HasPrefix(from, "+") {
 		from = "+" + from
@@ -275,6 +287,7 @@ func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client
 	typingCtx, typingCancel := context.WithCancel(ctx)
 	defer typingCancel()
 	go func() {
+		defer recoverGoroutine("typing refresh")
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
 		for {
