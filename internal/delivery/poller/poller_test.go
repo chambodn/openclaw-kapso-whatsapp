@@ -24,18 +24,18 @@ func TestPollFollowsPaginationCursor(t *testing.T) {
 		switch r.URL.Query().Get("after") {
 		case "":
 			// Page 1: two messages and a cursor to page 2.
-			fmt.Fprint(w, `{"data":[
+			_, _ = fmt.Fprint(w, `{"data":[
 				{"id":"m1","type":"text","from":"111","timestamp":"100","text":{"body":"one"}},
 				{"id":"m2","type":"text","from":"222","timestamp":"200","text":{"body":"two"}}
 			],"paging":{"cursors":{"after":"CURSOR1"}}}`)
 		case "CURSOR1":
 			// Page 2: one message, no further cursor.
-			fmt.Fprint(w, `{"data":[
+			_, _ = fmt.Fprint(w, `{"data":[
 				{"id":"m3","type":"text","from":"333","timestamp":"300","text":{"body":"three"}}
 			]}`)
 		default:
 			t.Errorf("unexpected after cursor %q", r.URL.Query().Get("after"))
-			fmt.Fprint(w, `{"data":[]}`)
+			_, _ = fmt.Fprint(w, `{"data":[]}`)
 		}
 	}))
 	defer srv.Close()
@@ -83,7 +83,7 @@ func TestPollSinglePageNoCursor(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&reqCount, 1)
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"data":[
+		_, _ = fmt.Fprint(w, `{"data":[
 			{"id":"only","type":"text","from":"111","timestamp":"100","text":{"body":"hi"}}
 		]}`)
 	}))
