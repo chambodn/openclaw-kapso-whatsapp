@@ -1,11 +1,11 @@
 package security
 
 import (
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/phone"
 )
 
 // Verdict represents the outcome of a guard check.
@@ -147,19 +147,6 @@ func (g *Guard) SessionKey(baseKey, from string) string {
 // "+15551234567" and "15551234567" both become "15551234567". This is required
 // because the Meta/WhatsApp webhook sends `from` without a leading +, while
 // config entries are commonly written with one.
-func normalize(phone string) string {
-	if phone == "" {
-		return ""
-	}
-
-	var b strings.Builder
-	b.Grow(len(phone))
-
-	for _, r := range phone {
-		if r >= '0' && r <= '9' {
-			b.WriteRune(r)
-		}
-	}
-
-	return b.String()
+func normalize(s string) string {
+	return phone.Normalize(s)
 }

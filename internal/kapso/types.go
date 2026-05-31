@@ -89,7 +89,7 @@ type KapsoMeta struct {
 	Direction   string      `json:"direction"`
 	Status      string      `json:"status"`
 	ContactName string      `json:"contact_name"`
-	HasMedia    bool        `json:"has_media,omitempty"`
+	HasMedia    bool        `json:"has_media"`
 	MediaURL    string      `json:"media_url,omitempty"`
 	MediaData   *MediaData  `json:"media_data,omitempty"`
 	Transcript  *Transcript `json:"transcript,omitempty"`
