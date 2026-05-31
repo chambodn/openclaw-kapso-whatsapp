@@ -84,23 +84,23 @@ func (c *cacheTranscriber) Transcribe(ctx context.Context, audio []byte, mimeTyp
 }
 
 // evictLocked drops expired entries and, if the map is still at capacity,
-// evicts the entry closest to expiry. Callers must hold c.mu. The full scan is
-// negligible relative to the transcription network call that precedes a store.
+// evicts the surviving entry closest to expiry. Callers must hold c.mu. A
+// single pass deletes expired entries and tracks the soonest-to-expire
+// survivor, so at most one full scan runs per store.
 func (c *cacheTranscriber) evictLocked(now time.Time) {
+	var oldestKey string
+	var oldestExpiry time.Time
 	for k, e := range c.items {
 		if !now.Before(e.expiry) {
 			delete(c.items, k)
+			continue
+		}
+		if oldestKey == "" || e.expiry.Before(oldestExpiry) {
+			oldestKey, oldestExpiry = k, e.expiry
 		}
 	}
 	if len(c.items) < c.maxEntries {
 		return
-	}
-	var oldestKey string
-	var oldestExpiry time.Time
-	for k, e := range c.items {
-		if oldestKey == "" || e.expiry.Before(oldestExpiry) {
-			oldestKey, oldestExpiry = k, e.expiry
-		}
 	}
 	if oldestKey != "" {
 		delete(c.items, oldestKey)

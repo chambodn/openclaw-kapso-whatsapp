@@ -8,12 +8,12 @@ import (
 	"log"
 	"os"
 	"runtime"
-	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/gorilla/websocket"
 )
 
@@ -301,6 +301,15 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	// Keepalive: bound reads so a half-open connection cannot hang readLoop
 	// (and every pending caller) indefinitely. The deadline is extended on any
 	// received frame and on pong replies; a ping is sent each pingPeriod.
+	//
+	// IMPORTANT: agent replies are delivered via JSONL polling (see pollReply),
+	// NOT over this socket, so in steady state the connection is data-idle and
+	// liveness depends entirely on the gateway answering our control pings with
+	// pongs. Standard RFC 6455 servers (including the OpenClaw gateway) do this
+	// automatically. A gateway that never ponged would have its connection torn
+	// down every pongWait; because this client does not yet auto-reconnect (see
+	// issue #5), that would break sends until the daemon restarts. If that ever
+	// regresses, add reconnect rather than removing the deadline.
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -329,7 +338,7 @@ const (
 // safe to call concurrently with the writes in sendRequest. It exits when the
 // connection's done channel is closed (i.e. readLoop has returned).
 func (oc *OpenClaw) pingLoop(conn *websocket.Conn, done chan struct{}) {
-	defer recoverGoroutine("openclaw pingLoop")
+	defer safe.Recover("openclaw pingLoop")
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 	for {
@@ -344,19 +353,11 @@ func (oc *OpenClaw) pingLoop(conn *websocket.Conn, done chan struct{}) {
 	}
 }
 
-// recoverGoroutine logs and swallows a panic so a single bad frame cannot crash
-// the daemon via one of this package's long-lived goroutines.
-func recoverGoroutine(label string) {
-	if r := recover(); r != nil {
-		log.Printf("recovered panic in %s: %v\n%s", label, r, debug.Stack())
-	}
-}
-
 // readLoop reads incoming frames and routes "res" frames to pending callers.
 // All other frames (events) are logged for observability. This is the sole
 // goroutine that reads from the WebSocket connection.
 func (oc *OpenClaw) readLoop() {
-	defer recoverGoroutine("openclaw readLoop")
+	defer safe.Recover("openclaw readLoop")
 	defer func() {
 		// Signal all pending sendRequest callers that the connection is gone.
 		oc.pendMu.Lock()

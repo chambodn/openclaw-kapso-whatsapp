@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/gorilla/websocket"
 )
 
@@ -35,7 +36,7 @@ type ZeroClaw struct {
 	url     string
 	token   string
 	idleTTL time.Duration
-	nowFunc func() time.Time // injectable clock for tests
+	nowFunc func() time.Time // clock; set by NewZeroClaw, overridable in tests
 
 	mu    sync.Mutex             // guards conns map
 	conns map[string]*senderConn // sender key → connection
@@ -172,7 +173,7 @@ func (zc *ZeroClaw) connFor(ctx context.Context, from string) (*senderConn, erro
 	zc.mu.Lock()
 	sc, ok := zc.conns[key]
 	if ok {
-		sc.lastUsed = zc.now()
+		sc.lastUsed = zc.nowFunc()
 	}
 	zc.mu.Unlock()
 	if ok {
@@ -189,12 +190,12 @@ func (zc *ZeroClaw) connFor(ctx context.Context, from string) (*senderConn, erro
 	zc.mu.Lock()
 	// Double-check: another goroutine may have raced us.
 	if existing, ok := zc.conns[key]; ok {
-		existing.lastUsed = zc.now()
+		existing.lastUsed = zc.nowFunc()
 		zc.mu.Unlock()
 		_ = conn.Close()
 		return existing, nil
 	}
-	sc.lastUsed = zc.now()
+	sc.lastUsed = zc.nowFunc()
 	zc.conns[key] = sc
 	zc.mu.Unlock()
 
@@ -232,19 +233,10 @@ func (zc *ZeroClaw) removeSender(key string) {
 	zc.mu.Unlock()
 }
 
-// now returns the current time via the injected clock, defaulting to time.Now
-// so connections constructed via struct literal (tests) work without setup.
-func (zc *ZeroClaw) now() time.Time {
-	if zc.nowFunc != nil {
-		return zc.nowFunc()
-	}
-	return time.Now()
-}
-
 // reapLoop periodically closes per-sender connections that have been idle
 // longer than idleTTL. It runs until ctx is cancelled (daemon shutdown).
 func (zc *ZeroClaw) reapLoop(ctx context.Context) {
-	defer recoverGoroutine("zeroclaw reapLoop")
+	defer safe.Recover("zeroclaw reapLoop")
 	ticker := time.NewTicker(zc.idleTTL / 2)
 	defer ticker.Stop()
 	for {
@@ -252,7 +244,7 @@ func (zc *ZeroClaw) reapLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			zc.reapIdle(zc.now())
+			zc.reapIdle(zc.nowFunc())
 		}
 	}
 }

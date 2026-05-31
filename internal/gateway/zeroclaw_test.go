@@ -113,7 +113,7 @@ func TestZeroClawSendAndReceive(t *testing.T) {
 	defer close(done)
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, token: "test-token", conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, token: "test-token", nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -172,7 +172,7 @@ func TestZeroClawErrorResponse(t *testing.T) {
 	defer close(done)
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -211,7 +211,7 @@ func TestZeroClawConnectSendsAuthToken(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	wantToken := "my-secret-zeroclaw-token"
-	zc := &ZeroClaw{url: wsURL, token: wantToken, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, token: wantToken, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -279,7 +279,7 @@ func TestZeroClawSessionIsolation(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -386,7 +386,7 @@ func TestZeroClawSameSenderReuseConn(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
