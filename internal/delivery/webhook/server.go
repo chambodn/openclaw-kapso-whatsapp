@@ -44,6 +44,10 @@ func (s *Server) Run(ctx context.Context, out chan<- delivery.Event) error {
 		Addr:              s.Addr,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bound slow or idle clients so they cannot hold a goroutine and
+		// file descriptor open indefinitely after (or instead of) a request.
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
 
 	ln, err := net.Listen("tcp", s.Addr)
@@ -142,9 +146,15 @@ func formatName(f webhookFormat) string {
 	}
 }
 
+// maxWebhookBodyBytes caps the request body size. Webhook payloads are small
+// JSON metadata; the limit prevents a malicious or buggy client from
+// exhausting memory with an oversized POST.
+const maxWebhookBodyBytes = 1 << 20 // 1 MiB
+
 // handleEvent parses a webhook POST, detects the payload format (Kapso native
 // or Meta), and emits events for inbound messages.
 func (s *Server) handleEvent(w http.ResponseWriter, r *http.Request, out chan<- delivery.Event) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, "read error", http.StatusBadRequest)

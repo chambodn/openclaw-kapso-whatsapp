@@ -158,6 +158,28 @@ func TestHandleVerification(t *testing.T) {
 	}
 }
 
+// TestHandleEventRejectsOversizedBody verifies the body size cap rejects a POST
+// larger than maxWebhookBodyBytes instead of buffering it all into memory.
+func TestHandleEventRejectsOversizedBody(t *testing.T) {
+	out := make(chan delivery.Event, 1)
+	srv := newTestServer()
+
+	big := strings.Repeat("a", maxWebhookBodyBytes+1)
+	req := httptest.NewRequest(http.MethodPost, "/webhook", strings.NewReader(big))
+	w := httptest.NewRecorder()
+
+	srv.handleEvent(w, req, out)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d for oversized body", w.Code, http.StatusBadRequest)
+	}
+	select {
+	case e := <-out:
+		t.Fatalf("oversized body should not emit an event, got %+v", e)
+	default:
+	}
+}
+
 func TestHandleEvent_KapsoFormat(t *testing.T) {
 	payload := kapso.KapsoWebhookPayload{
 		Type: "whatsapp.message.received",
