@@ -477,9 +477,11 @@ func TestConnectWithSignerButNoNonceErrors(t *testing.T) {
 	}
 }
 
-// TestGetSessionFileFallsBackToBaseKey verifies that when a per-sender
-// session key is not in sessions.json, the base key is found instead.
-func TestGetSessionFileFallsBackToBaseKey(t *testing.T) {
+// TestGetSessionFileCanonicalFallbackResolves verifies that a base key stored
+// under the canonical "agent:KEY:KEY" form resolves via the exact canonical
+// fallback, and that an absent per-sender key returns an error rather than
+// cross-resolving onto the base session.
+func TestGetSessionFileCanonicalFallbackResolves(t *testing.T) {
 	dir := t.TempDir()
 	sessionsJSON := filepath.Join(dir, "sessions.json")
 
