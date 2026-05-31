@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -573,7 +574,7 @@ func getAssistantReplies(sessionFile string, since time.Time) ([]assistantReply,
 	}
 
 	var replies []assistantReply
-	for i, line := range strings.Split(string(data), "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
@@ -610,12 +611,22 @@ func getAssistantReplies(sessionFile string, since time.Time) ([]assistantReply,
 			}
 		}
 		if len(texts) > 0 {
+			text := strings.Join(texts, "\n")
 			replies = append(replies, assistantReply{
-				Key:  fmt.Sprintf("%s:%d", sessionFile, i),
-				Text: strings.Join(texts, "\n"),
+				Key:  stableReplyKey(sessionFile, entry.Timestamp, text),
+				Text: text,
 			})
 		}
 	}
 
 	return replies, nil
+}
+
+// stableReplyKey derives a dedup key from the reply's session, timestamp, and
+// content hash rather than its line position. Line indices shift when the
+// session JSONL is rotated or compacted, which would make an already-delivered
+// reply look new and re-send it; timestamp+content is stable across rotation.
+func stableReplyKey(sessionFile string, ts time.Time, text string) string {
+	sum := sha256.Sum256([]byte(text))
+	return fmt.Sprintf("%s:%s:%x", sessionFile, ts.UTC().Format(time.RFC3339Nano), sum[:8])
 }
