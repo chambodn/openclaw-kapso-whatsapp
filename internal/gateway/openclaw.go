@@ -117,6 +117,28 @@ type assistantReply struct {
 	Text string
 }
 
+// connSession holds the state for one live gateway connection. A fresh one is
+// created on every (re)connect; readLoop, pingLoop, and sendRequest each bind to
+// a specific session, so a reconnect can never tangle two generations (e.g.
+// route a response to the wrong connection's pending map, or close the wrong
+// done channel).
+type connSession struct {
+	conn    *websocket.Conn
+	wmu     sync.Mutex // serialises WriteMessage calls + seq on this conn
+	seq     int
+	pendMu  sync.Mutex
+	pending map[string]chan responseFrame // request id -> response channel
+	done    chan struct{}                 // closed once readLoop exits
+}
+
+func (cs *connSession) nextID() string {
+	cs.wmu.Lock()
+	cs.seq++
+	id := cs.seq
+	cs.wmu.Unlock()
+	return fmt.Sprintf("kapso-%d", id)
+}
+
 // OpenClaw implements Gateway for the OpenClaw agent runtime.
 type OpenClaw struct {
 	url          string
@@ -126,30 +148,30 @@ type OpenClaw struct {
 	sessionKey   string
 	role         string
 	scopes       []string
-
-	conn         *websocket.Conn
-	mu           sync.Mutex // guards conn, seq, and writes
-	seq          int
 	tracker      *replyTracker
 	pollInterval time.Duration // session-poll cadence; injectable for tests
 
-	// Response routing: readLoop routes "res" frames to pending callers.
-	pending map[string]chan responseFrame
-	pendMu  sync.Mutex    // guards pending map (separate from mu)
-	done    chan struct{} // closed when readLoop exits
+	autoReconnect bool // reconnect on drop; true via the production constructors
+
+	mu        sync.Mutex    // guards cur and closing
+	cur       *connSession  // current connection; nil before connect / mid-reconnect
+	closing   chan struct{} // closed by Close to stop the supervisor
+	closeOnce sync.Once
 }
 
 // NewOpenClaw creates an OpenClaw gateway from config.
 func NewOpenClaw(cfg config.GatewayConfig) *OpenClaw {
 	return &OpenClaw{
-		url:          cfg.URL,
-		token:        cfg.Token,
-		sessionsJSON: cfg.SessionsJSON,
-		sessionKey:   cfg.SessionKey,
-		role:         cfg.Role,
-		scopes:       cfg.Scopes,
-		tracker:      newReplyTracker(),
-		pollInterval: 3 * time.Second,
+		url:           cfg.URL,
+		token:         cfg.Token,
+		sessionsJSON:  cfg.SessionsJSON,
+		sessionKey:    cfg.SessionKey,
+		role:          cfg.Role,
+		scopes:        cfg.Scopes,
+		tracker:       newReplyTracker(),
+		pollInterval:  3 * time.Second,
+		autoReconnect: true,
+		closing:       make(chan struct{}),
 	}
 }
 
@@ -160,17 +182,27 @@ func NewOpenClawWithSigner(cfg config.GatewayConfig, signer Signer) *OpenClaw {
 	return oc
 }
 
-func (oc *OpenClaw) nextID() string {
-	oc.seq++
-	return fmt.Sprintf("kapso-%d", oc.seq)
+// Connect establishes the first connection and, in production, starts the
+// supervisor that reconnects on drops.
+func (oc *OpenClaw) Connect(ctx context.Context) error {
+	if err := oc.connectOnce(ctx); err != nil {
+		return err
+	}
+	if oc.autoReconnect {
+		oc.mu.Lock()
+		if oc.closing == nil {
+			oc.closing = make(chan struct{})
+		}
+		oc.mu.Unlock()
+		go oc.supervise(ctx)
+	}
+	return nil
 }
 
-// Connect establishes the WebSocket connection and completes the
-// challenge-response auth handshake with the OpenClaw gateway.
-func (oc *OpenClaw) Connect(ctx context.Context) error {
-	oc.mu.Lock()
-	defer oc.mu.Unlock()
-
+// connectOnce dials the gateway and completes the challenge-response auth
+// handshake, then installs the resulting connSession and starts its read/ping
+// loops. It is called for the initial connect and for every reconnect.
+func (oc *OpenClaw) connectOnce(ctx context.Context) error {
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
 	}
@@ -179,14 +211,17 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect to gateway: %w", err)
 	}
-	oc.conn = conn
+	cs := &connSession{
+		conn:    conn,
+		pending: make(map[string]chan responseFrame),
+		done:    make(chan struct{}),
+	}
 
 	// Read the challenge from the gateway.
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("read challenge: %w", err)
 	}
 
@@ -200,7 +235,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	}
 	if err := json.Unmarshal(msg, &challenge); err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("parse challenge frame: %w", err)
 	}
 
@@ -218,7 +252,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 		nonce := challenge.Payload.Nonce
 		if nonce == "" {
 			_ = conn.Close()
-			oc.conn = nil
 			return fmt.Errorf("gateway challenge missing nonce")
 		}
 		signedAt := time.Now().UnixMilli()
@@ -236,7 +269,7 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	// Send connect request.
 	connectReq := requestFrame{
 		Type:   "req",
-		ID:     oc.nextID(),
+		ID:     cs.nextID(),
 		Method: "connect",
 		Params: connectParams{
 			// Advertise a protocol range. The gateway accepts the connection
@@ -265,7 +298,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	data, err := json.Marshal(connectReq)
 	if err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("marshal connect request: %w", err)
 	}
 
@@ -273,7 +305,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 
 	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("send connect: %w", err)
 	}
 
@@ -282,7 +313,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	_, msg, err = conn.ReadMessage()
 	if err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("read connect response: %w", err)
 	}
 
@@ -291,13 +321,11 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	var resp responseFrame
 	if err := json.Unmarshal(msg, &resp); err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("parse connect response: %w", err)
 	}
 
 	if resp.Error != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("connect rejected: %s", string(resp.Error))
 	}
 
@@ -305,27 +333,88 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	// (and every pending caller) indefinitely. The deadline is extended on any
 	// received frame and on pong replies; a ping is sent each pingPeriod.
 	//
-	// IMPORTANT: agent replies are delivered via JSONL polling (see pollReply),
-	// NOT over this socket, so in steady state the connection is data-idle and
-	// liveness depends entirely on the gateway answering our control pings with
-	// pongs. Standard RFC 6455 servers (including the OpenClaw gateway) do this
-	// automatically. A gateway that never ponged would have its connection torn
-	// down every pongWait; because this client does not yet auto-reconnect (see
-	// issue #5), that would break sends until the daemon restarts. If that ever
-	// regresses, add reconnect rather than removing the deadline.
+	// Agent replies are delivered via JSONL polling (see pollReply), NOT over
+	// this socket, so in steady state the connection is data-idle and liveness
+	// depends on the gateway answering our control pings with pongs (standard
+	// RFC 6455 behaviour). If a gateway never ponged, the connection would be
+	// torn down every pongWait; the supervisor then reconnects with backoff.
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
-	// Initialize response routing for the new connection.
-	oc.pending = make(map[string]chan responseFrame)
-	oc.done = make(chan struct{})
-	go oc.pingLoop(conn, oc.done)
-	go oc.readLoop()
+	oc.mu.Lock()
+	oc.cur = cs
+	oc.mu.Unlock()
+	go oc.pingLoop(cs)
+	go oc.readLoop(cs)
 
 	log.Printf("authenticated with gateway at %s", oc.url)
 	return nil
+}
+
+// supervise reconnects the gateway whenever the live connection drops, until
+// the daemon context is cancelled or Close is called. It runs only when
+// autoReconnect is set (the production constructors). Each iteration waits for
+// the current session's readLoop to exit, then reconnects with backoff.
+func (oc *OpenClaw) supervise(ctx context.Context) {
+	defer safe.Recover("openclaw supervise")
+	for {
+		oc.mu.Lock()
+		cs := oc.cur
+		oc.mu.Unlock()
+		if cs == nil {
+			return
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-oc.closing:
+			return
+		case <-cs.done:
+		}
+
+		// Connection dropped. Stop if we're shutting down; otherwise reconnect.
+		select {
+		case <-ctx.Done():
+			return
+		case <-oc.closing:
+			return
+		default:
+		}
+
+		log.Printf("openclaw: gateway connection lost, reconnecting...")
+		if !oc.reconnect(ctx) {
+			return
+		}
+		log.Printf("openclaw: reconnected to gateway")
+	}
+}
+
+// reconnect retries connectOnce with exponential backoff until it succeeds or
+// the daemon is shutting down. Returns false if it stopped without connecting.
+func (oc *OpenClaw) reconnect(ctx context.Context) bool {
+	const maxBackoff = 30 * time.Second
+	backoff := time.Second
+	for {
+		if err := oc.connectOnce(ctx); err == nil {
+			return true
+		} else {
+			log.Printf("openclaw: reconnect attempt failed: %v (retrying in %s)", err, backoff)
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-oc.closing:
+			return false
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > maxBackoff {
+			backoff = maxBackoff
+		}
+	}
 }
 
 // WebSocket keepalive timings. A ping is sent every pingPeriod; the read side
@@ -337,55 +426,49 @@ const (
 )
 
 // pingLoop sends a periodic WebSocket ping so an idle-but-healthy connection
-// stays alive and a dead one is detected within pongWait. WriteControl is
-// safe to call concurrently with the writes in sendRequest. It exits when the
-// connection's done channel is closed (i.e. readLoop has returned).
-func (oc *OpenClaw) pingLoop(conn *websocket.Conn, done chan struct{}) {
+// stays alive and a dead one is detected within pongWait. WriteControl is safe
+// to call concurrently with the writes in sendRequest. It exits when the
+// session's done channel is closed (i.e. readLoop has returned).
+func (oc *OpenClaw) pingLoop(cs *connSession) {
 	defer safe.Recover("openclaw pingLoop")
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-done:
+		case <-cs.done:
 			return
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+			if err := cs.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
 				return
 			}
 		}
 	}
 }
 
-// readLoop reads incoming frames and routes "res" frames to pending callers.
-// All other frames (events) are logged for observability. This is the sole
-// goroutine that reads from the WebSocket connection.
-func (oc *OpenClaw) readLoop() {
+// readLoop reads incoming frames for one connection and routes "res" frames to
+// that session's pending callers. It is the sole reader of the session's conn;
+// on exit it fails all pending callers and closes the session's done channel,
+// which is what the supervisor waits on to trigger a reconnect.
+func (oc *OpenClaw) readLoop(cs *connSession) {
 	defer safe.Recover("openclaw readLoop")
 	defer func() {
 		// Signal all pending sendRequest callers that the connection is gone.
-		oc.pendMu.Lock()
-		for id, ch := range oc.pending {
+		cs.pendMu.Lock()
+		for id, ch := range cs.pending {
 			close(ch)
-			delete(oc.pending, id)
+			delete(cs.pending, id)
 		}
-		oc.pendMu.Unlock()
-		close(oc.done)
+		cs.pendMu.Unlock()
+		close(cs.done)
 	}()
 
 	for {
-		oc.mu.Lock()
-		conn := oc.conn
-		oc.mu.Unlock()
-		if conn == nil {
-			return
-		}
-
-		_, msg, err := conn.ReadMessage()
+		_, msg, err := cs.conn.ReadMessage()
 		if err != nil {
 			return
 		}
 		// Any traffic proves the connection is alive — extend the deadline.
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var frame responseFrame
 		if err := json.Unmarshal(msg, &frame); err != nil {
@@ -395,12 +478,12 @@ func (oc *OpenClaw) readLoop() {
 
 		// Route responses to waiting callers by request ID.
 		if frame.Type == "res" && frame.ID != "" {
-			oc.pendMu.Lock()
-			if ch, ok := oc.pending[frame.ID]; ok {
+			cs.pendMu.Lock()
+			if ch, ok := cs.pending[frame.ID]; ok {
 				ch <- frame
-				delete(oc.pending, frame.ID)
+				delete(cs.pending, frame.ID)
 			}
-			oc.pendMu.Unlock()
+			cs.pendMu.Unlock()
 			continue
 		}
 
@@ -408,17 +491,19 @@ func (oc *OpenClaw) readLoop() {
 	}
 }
 
-// sendRequest sends a request frame and waits for the matching response.
-// The caller gets the full responseFrame so it can inspect Result or Error.
+// sendRequest sends a request frame and waits for the matching response. It
+// binds to the current connSession for its whole lifetime, so an in-flight
+// request is unaffected by a concurrent reconnect (it waits on its own session's
+// done channel, not a swapped field).
 func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params interface{}) (responseFrame, error) {
-	// Write phase — hold mu for conn check, ID generation, and write.
 	oc.mu.Lock()
-	if oc.conn == nil {
-		oc.mu.Unlock()
+	cs := oc.cur
+	oc.mu.Unlock()
+	if cs == nil {
 		return responseFrame{}, fmt.Errorf("not connected to gateway")
 	}
 
-	id := oc.nextID()
+	id := cs.nextID()
 	req := requestFrame{
 		Type:   "req",
 		ID:     id,
@@ -428,24 +513,26 @@ func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params inter
 
 	data, err := json.Marshal(req)
 	if err != nil {
-		oc.mu.Unlock()
 		return responseFrame{}, fmt.Errorf("marshal %s request: %w", method, err)
 	}
 
 	// Register response channel before sending so readLoop can't race us.
 	ch := make(chan responseFrame, 1)
-	oc.pendMu.Lock()
-	oc.pending[id] = ch
-	oc.pendMu.Unlock()
+	cs.pendMu.Lock()
+	cs.pending[id] = ch
+	cs.pendMu.Unlock()
 
-	if err := oc.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		oc.mu.Unlock()
-		oc.pendMu.Lock()
-		delete(oc.pending, id)
-		oc.pendMu.Unlock()
+	// Serialise writes on this conn (gorilla requires it); WriteControl pings
+	// from pingLoop remain safe concurrently.
+	cs.wmu.Lock()
+	err = cs.conn.WriteMessage(websocket.TextMessage, data)
+	cs.wmu.Unlock()
+	if err != nil {
+		cs.pendMu.Lock()
+		delete(cs.pending, id)
+		cs.pendMu.Unlock()
 		return responseFrame{}, fmt.Errorf("send %s: %w", method, err)
 	}
-	oc.mu.Unlock()
 
 	// Wait for readLoop to deliver the response.
 	select {
@@ -455,11 +542,11 @@ func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params inter
 		}
 		return resp, nil
 	case <-ctx.Done():
-		oc.pendMu.Lock()
-		delete(oc.pending, id)
-		oc.pendMu.Unlock()
+		cs.pendMu.Lock()
+		delete(cs.pending, id)
+		cs.pendMu.Unlock()
 		return responseFrame{}, ctx.Err()
-	case <-oc.done:
+	case <-cs.done:
 		return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response", method)
 	}
 }
@@ -549,23 +636,25 @@ func (oc *OpenClaw) pollReply(ctx context.Context, sessionKey string) (string, e
 	}
 }
 
-// Close closes the WebSocket connection and waits for readLoop to exit.
+// Close stops the supervisor and closes the current connection, waiting for its
+// readLoop to exit.
 func (oc *OpenClaw) Close() error {
+	// Stop the supervisor first so it does not reconnect while we tear down.
 	oc.mu.Lock()
-	if oc.conn == nil {
-		oc.mu.Unlock()
-		return nil
+	if oc.closing != nil {
+		oc.closeOnce.Do(func() { close(oc.closing) })
 	}
-	err := oc.conn.Close()
-	oc.conn = nil
-	done := oc.done
+	cs := oc.cur
+	oc.cur = nil
 	oc.mu.Unlock()
 
+	if cs == nil {
+		return nil
+	}
+	err := cs.conn.Close()
 	// Wait for readLoop to finish cleanup. The wait is bounded because
 	// conn.Close() causes ReadMessage() to return an error immediately.
-	if done != nil {
-		<-done
-	}
+	<-cs.done
 	return err
 }
 
