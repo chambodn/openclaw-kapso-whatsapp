@@ -1,6 +1,7 @@
 package kapso
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -38,7 +39,7 @@ type Paging struct {
 }
 
 // ListMessages fetches messages from the Kapso API.
-func (c *Client) ListMessages(params ListMessagesParams) (*ListMessagesResponse, error) {
+func (c *Client) ListMessages(ctx context.Context, params ListMessagesParams) (*ListMessagesResponse, error) {
 	u, err := url.Parse(fmt.Sprintf("%s/%s/messages", c.getBaseURL(), c.PhoneNumberID))
 	if err != nil {
 		return nil, fmt.Errorf("parse URL: %w", err)
@@ -59,7 +60,7 @@ func (c *Client) ListMessages(params ListMessagesParams) (*ListMessagesResponse,
 	}
 	u.RawQuery = q.Encode()
 
-	req, err := http.NewRequest("GET", u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
 	if err != nil {
 		return nil, fmt.Errorf("create request: %w", err)
 	}

@@ -30,7 +30,7 @@ func TestExtractText_Text(t *testing.T) {
 		From: "+1234567890",
 		Text: &kapso.TextContent{Body: "hello world"},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for text message")
 	}
@@ -45,7 +45,7 @@ func TestExtractText_TextNilBody(t *testing.T) {
 		Type: "text",
 		From: "+1234567890",
 	}
-	_, ok := ExtractText(msg, nil, nil, 0)
+	_, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if ok {
 		t.Fatal("expected ok=false for text message with nil Text")
 	}
@@ -62,7 +62,7 @@ func TestExtractText_Image(t *testing.T) {
 			Caption:  "sunset photo",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for image message")
 	}
@@ -92,7 +92,7 @@ func TestExtractText_ImageWithKapsoMediaURL(t *testing.T) {
 			MediaURL: "https://api.kapso.ai/media/photo.jpg",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for image message")
 	}
@@ -112,7 +112,7 @@ func TestExtractText_Document(t *testing.T) {
 			Filename: "report.pdf",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for document message")
 	}
@@ -135,7 +135,7 @@ func TestExtractText_DocumentCaptionFallback(t *testing.T) {
 			Caption:  "my report",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -154,7 +154,7 @@ func TestExtractText_Audio(t *testing.T) {
 			MimeType: "audio/ogg",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for audio message")
 	}
@@ -177,7 +177,7 @@ func TestExtractText_Video(t *testing.T) {
 			Caption:  "funny clip",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for video message")
 	}
@@ -201,7 +201,7 @@ func TestExtractText_Location(t *testing.T) {
 			Address:   "Peru",
 		},
 	}
-	text, ok := ExtractText(msg, nil, nil, 0)
+	text, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 	if !ok {
 		t.Fatal("expected ok=true for location message")
 	}
@@ -244,7 +244,7 @@ func TestExtractText_UnsupportedType(t *testing.T) {
 			MimeType: "image/webp",
 		},
 	}
-	_, ok := ExtractText(msg, client, nil, 0)
+	_, ok := ExtractText(context.Background(), msg, client, nil, 0)
 	if ok {
 		t.Fatal("expected ok=false for unsupported sticker type")
 	}
@@ -265,7 +265,7 @@ func TestExtractText_NilMediaContent(t *testing.T) {
 			Type: typ,
 			From: "+1234567890",
 		}
-		_, ok := ExtractText(msg, nil, nil, 0)
+		_, ok := ExtractText(context.Background(), msg, nil, nil, 0)
 		if ok {
 			t.Errorf("expected ok=false for %s with nil content", typ)
 		}
@@ -351,7 +351,7 @@ func TestExtractText_AudioServerTranscript(t *testing.T) {
 	}
 
 	// Even with a local transcriber configured, server-side transcript wins.
-	text, ok := ExtractText(msg, nil, &mockTranscriber{text: "local result"}, 1024*1024)
+	text, ok := ExtractText(context.Background(), msg, nil, &mockTranscriber{text: "local result"}, 1024*1024)
 	if !ok {
 		t.Fatal("expected ok=true")
 	}
@@ -435,7 +435,7 @@ func TestExtractText_AudioLocalTranscription(t *testing.T) {
 				Kapso: tc.kapso,
 			}
 
-			text, ok := ExtractText(msg, client, tc.transcriber, 1024*1024)
+			text, ok := ExtractText(context.Background(), msg, client, tc.transcriber, 1024*1024)
 			if !ok {
 				t.Fatal("expected ok=true")
 			}
@@ -454,7 +454,7 @@ func TestExtractText_AudioNilContent(t *testing.T) {
 		From: "+1234567890",
 		// Audio is nil
 	}
-	text, ok := ExtractText(msg, nil, &mockTranscriber{text: "should not be called"}, 1024)
+	text, ok := ExtractText(context.Background(), msg, nil, &mockTranscriber{text: "should not be called"}, 1024)
 	if ok {
 		t.Fatal("expected ok=false for audio message with nil Audio content")
 	}

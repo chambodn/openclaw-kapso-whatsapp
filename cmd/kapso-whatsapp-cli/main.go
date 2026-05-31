@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/kapso"
@@ -75,7 +77,9 @@ func handleSend(args []string) {
 	}
 
 	client := kapso.NewClient(cfg.Kapso.APIKey, cfg.Kapso.PhoneNumberID)
-	resp, err := client.SendText(to, text)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := client.SendText(ctx, to, text)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)

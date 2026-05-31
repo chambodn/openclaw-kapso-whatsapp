@@ -1,6 +1,7 @@
 package preflight
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
@@ -96,7 +97,9 @@ func checkKapsoCredentials(cfg *config.Config, client *kapso.Client) Result {
 		client = kapso.NewClient(cfg.Kapso.APIKey, cfg.Kapso.PhoneNumberID)
 	}
 
-	_, err := client.ListMessages(kapso.ListMessagesParams{Limit: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := client.ListMessages(ctx, kapso.ListMessagesParams{Limit: 1})
 	if err != nil {
 		return Result{
 			Name:   "Kapso credentials",

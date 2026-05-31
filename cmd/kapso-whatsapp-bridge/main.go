@@ -172,7 +172,7 @@ func main() {
 			case security.Deny:
 				log.Printf("guard: blocked unauthorized sender %s", evt.From)
 				if msg := guard.DenyMessage(); msg != "" {
-					if _, err := client.SendText(evt.From, msg); err != nil {
+					if _, err := client.SendText(ctx, evt.From, msg); err != nil {
 						log.Printf("guard: failed to send deny message to %s: %v", evt.From, err)
 					}
 				}
@@ -215,33 +215,33 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 		from = "+" + from
 	}
 
-	if err := client.MarkReadWithTyping(evt.ID); err != nil {
+	if err := client.MarkReadWithTyping(ctx, evt.ID); err != nil {
 		log.Printf("command: failed to mark read for %s: %v", evt.ID, err)
 	}
 
 	name, args, ok := d.Parse(evt.Text)
 	if !ok {
 		msg := fmt.Sprintf("Unknown command. Send %shelp for available commands.", d.Prefix())
-		if _, err := client.SendText(from, msg); err != nil {
+		if _, err := client.SendText(ctx, from, msg); err != nil {
 			log.Printf("command: failed to send reply to %s: %v", from, err)
 		}
-		_ = client.MarkRead(evt.ID)
+		_ = client.MarkRead(ctx, evt.ID)
 		return
 	}
 	if !d.Exists(name) {
 		msg := fmt.Sprintf("Unknown command %s%s. Send %shelp for available commands.", d.Prefix(), name, d.Prefix())
-		if _, err := client.SendText(from, msg); err != nil {
+		if _, err := client.SendText(ctx, from, msg); err != nil {
 			log.Printf("command: failed to send reply to %s: %v", from, err)
 		}
-		_ = client.MarkRead(evt.ID)
+		_ = client.MarkRead(ctx, evt.ID)
 		return
 	}
 	if !d.CanRun(name, role) {
 		msg := fmt.Sprintf("You don't have permission to use %s%s.", d.Prefix(), name)
-		if _, err := client.SendText(from, msg); err != nil {
+		if _, err := client.SendText(ctx, from, msg); err != nil {
 			log.Printf("command: failed to send reply to %s: %v", from, err)
 		}
-		_ = client.MarkRead(evt.ID)
+		_ = client.MarkRead(ctx, evt.ID)
 		return
 	}
 
@@ -249,7 +249,7 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 
 	// Send ack before potentially slow or self-terminating commands.
 	if ack := d.Ack(name); ack != "" {
-		if _, err := client.SendText(from, ack); err != nil {
+		if _, err := client.SendText(ctx, from, ack); err != nil {
 			log.Printf("command: failed to send ack to %s: %v", from, err)
 		}
 	}
@@ -265,13 +265,13 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 	if reply != "" {
 		chunks := gateway.SplitMessage(gateway.MdToWhatsApp(reply), 4096)
 		for _, chunk := range chunks {
-			if _, err := client.SendText(from, chunk); err != nil {
+			if _, err := client.SendText(ctx, from, chunk); err != nil {
 				log.Printf("command: failed to send reply chunk to %s: %v", from, err)
 			}
 		}
 	}
 
-	if err := client.MarkRead(evt.ID); err != nil {
+	if err := client.MarkRead(ctx, evt.ID); err != nil {
 		log.Printf("command: failed to dismiss typing for %s: %v", evt.ID, err)
 	}
 }
@@ -286,7 +286,7 @@ func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client
 	}
 
 	// Show typing indicator.
-	if err := client.MarkReadWithTyping(evt.ID); err != nil {
+	if err := client.MarkReadWithTyping(ctx, evt.ID); err != nil {
 		log.Printf("relay: failed to mark read with typing for %s: %v", evt.ID, err)
 	}
 
@@ -302,7 +302,7 @@ func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client
 			case <-typingCtx.Done():
 				return
 			case <-ticker.C:
-				if err := client.MarkReadWithTyping(evt.ID); err != nil {
+				if err := client.MarkReadWithTyping(typingCtx, evt.ID); err != nil {
 					log.Printf("relay: failed to refresh typing for %s: %v", evt.ID, err)
 				}
 			}
@@ -328,11 +328,11 @@ func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client
 	if err != nil {
 		log.Printf("error getting agent reply for %s: %v", evt.ID, err)
 		if errorMessage != "" {
-			if _, sendErr := client.SendText(from, errorMessage); sendErr != nil {
+			if _, sendErr := client.SendText(ctx, from, errorMessage); sendErr != nil {
 				log.Printf("relay: failed to send error message to %s: %v", from, sendErr)
 			}
 		}
-		if markErr := client.MarkRead(evt.ID); markErr != nil {
+		if markErr := client.MarkRead(ctx, evt.ID); markErr != nil {
 			log.Printf("relay: failed to dismiss typing for %s: %v", evt.ID, markErr)
 		}
 		return
@@ -342,14 +342,14 @@ func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client
 	text := gateway.MdToWhatsApp(reply)
 	chunks := gateway.SplitMessage(text, 4096)
 	for _, chunk := range chunks {
-		if _, err := client.SendText(from, chunk); err != nil {
+		if _, err := client.SendText(ctx, from, chunk); err != nil {
 			log.Printf("relay: failed to send WhatsApp chunk to %s: %v", from, err)
 		}
 	}
 	log.Printf("relay: sent %d chunk(s) to %s", len(chunks), from)
 
 	// Dismiss typing indicator.
-	if err := client.MarkRead(evt.ID); err != nil {
+	if err := client.MarkRead(ctx, evt.ID); err != nil {
 		log.Printf("relay: failed to dismiss typing for %s: %v", evt.ID, err)
 	}
 }
