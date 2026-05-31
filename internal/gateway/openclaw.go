@@ -127,10 +127,11 @@ type OpenClaw struct {
 	role         string
 	scopes       []string
 
-	conn    *websocket.Conn
-	mu      sync.Mutex // guards conn, seq, and writes
-	seq     int
-	tracker *replyTracker
+	conn         *websocket.Conn
+	mu           sync.Mutex // guards conn, seq, and writes
+	seq          int
+	tracker      *replyTracker
+	pollInterval time.Duration // session-poll cadence; injectable for tests
 
 	// Response routing: readLoop routes "res" frames to pending callers.
 	pending map[string]chan responseFrame
@@ -148,6 +149,7 @@ func NewOpenClaw(cfg config.GatewayConfig) *OpenClaw {
 		role:         cfg.Role,
 		scopes:       cfg.Scopes,
 		tracker:      newReplyTracker(),
+		pollInterval: 3 * time.Second,
 	}
 }
 
@@ -491,17 +493,22 @@ func (oc *OpenClaw) SendAndReceive(ctx context.Context, req *Request) (string, e
 	return oc.pollReply(ctx, sessionKey)
 }
 
-// pollReply polls the session JSONL file until an unclaimed assistant reply
-// appears. When session isolation produces a per-sender key that doesn't
-// exist in sessions.json, it falls back to the base session key.
+// pollReply polls the given session's JSONL transcript until an unclaimed
+// assistant reply appears. It resolves ONLY that session key and never falls
+// back to another session: OpenClaw creates the per-sender session eagerly when
+// it handles chat.send (the sessions.json entry and sessionFile are written
+// before the agent replies), so the transcript appears within a poll tick.
+// Failing closed preserves cross-user isolation — a fallback to a shared base
+// session could deliver one user's reply to another.
 func (oc *OpenClaw) pollReply(ctx context.Context, sessionKey string) (string, error) {
 	since := time.Now().UTC()
 	deadline := time.Now().Add(10 * time.Minute)
-	ticker := time.NewTicker(3 * time.Second)
+	interval := oc.pollInterval
+	if interval <= 0 {
+		interval = 3 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	useFallback := sessionKey != oc.sessionKey
-	loggedFallback := false
 
 	for {
 		if time.Now().After(deadline) {
@@ -515,14 +522,9 @@ func (oc *OpenClaw) pollReply(ctx context.Context, sessionKey string) (string, e
 		}
 
 		sessionFile, err := getSessionFile(oc.sessionsJSON, sessionKey)
-		if err != nil && useFallback {
-			sessionFile, err = getSessionFile(oc.sessionsJSON, oc.sessionKey)
-			if err == nil && !loggedFallback {
-				log.Printf("openclaw: per-sender session %q not found, using base session %q", sessionKey, oc.sessionKey)
-				loggedFallback = true
-			}
-		}
 		if err != nil {
+			// Fail closed — keep polling this session only; never substitute
+			// another session's transcript.
 			log.Printf("openclaw: %v", err)
 			continue
 		}
@@ -581,8 +583,15 @@ func normalizeMetadata(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
 
-// getSessionFile reads sessions.json and returns the path to the active
-// session JSONL file for the given session key.
+// getSessionFile reads sessions.json and returns the path to the active session
+// JSONL file for the given session key, resolved by EXACT match.
+//
+// OpenClaw stores an explicitly-supplied session key verbatim (lowercased) as
+// the store key, so an exact lookup is correct. It must NOT substring-match:
+// with per-sender keys like "<base>-wa-<digits>", one sender's key is a
+// substring of another's ("...-wa-1" is contained in "...-wa-15"), so a loose
+// match could resolve a sender onto another sender's transcript — a cross-user
+// reply leak.
 func getSessionFile(sessionsJSON, sessionKey string) (string, error) {
 	data, err := os.ReadFile(sessionsJSON)
 	if err != nil {
@@ -596,17 +605,15 @@ func getSessionFile(sessionsJSON, sessionKey string) (string, error) {
 		return "", fmt.Errorf("parse sessions.json: %w", err)
 	}
 
-	// Try the canonical key first: "agent:KEY:KEY"
-	canonical := "agent:" + sessionKey + ":" + sessionKey
-	if s, ok := sessions[canonical]; ok && s.SessionFile != "" {
+	key := strings.ToLower(strings.TrimSpace(sessionKey))
+	if s, ok := sessions[key]; ok && s.SessionFile != "" {
 		return s.SessionFile, nil
 	}
-
-	// Fall back: first entry whose key contains sessionKey.
-	for k, s := range sessions {
-		if strings.Contains(k, sessionKey) && s.SessionFile != "" {
-			return s.SessionFile, nil
-		}
+	// Backward-compatible exact fallback for any session stored under the
+	// canonical "agent:KEY:KEY" form (derived, non-explicit sessions). Still an
+	// exact lookup — no substring matching.
+	if s, ok := sessions["agent:"+key+":"+key]; ok && s.SessionFile != "" {
+		return s.SessionFile, nil
 	}
 
 	return "", fmt.Errorf("no session file found for key %q in %s", sessionKey, sessionsJSON)
