@@ -18,7 +18,8 @@ type cacheEntry struct {
 // hash of the audio bytes for a configurable TTL. Errors are never cached.
 //
 // The mutex is released before calling the inner Transcriber to avoid holding
-// a lock during potentially long network calls (see RESEARCH.md Pitfall 1).
+// a lock during the potentially long network call, which would serialize all
+// concurrent cache misses.
 // defaultCacheMaxEntries caps the number of cached transcripts so the map
 // cannot grow without bound as unique audio messages arrive. Each entry is a
 // hash key plus a short transcript, so this is a small memory ceiling.
