@@ -12,6 +12,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Match the release build (GoReleaser) and the documented constraint in
+      # CLAUDE.md: the project builds with CGO disabled.
+      CGO_ENABLED: 0
     steps:
       - uses: actions/checkout@v6
 
