@@ -20,6 +20,7 @@ import (
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/device"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/gateway"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/kapso"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/security"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/tailscale"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/transcribe"
@@ -158,9 +159,14 @@ func main() {
 		log.Printf("commands: prefix=%q, %d command(s) configured", cfg.Commands.Prefix, len(cfg.Commands.Definitions))
 	}
 
-	// Consume loop — identical for all sources.
+	// Consume loop — identical for all sources. Each event is dispatched inside
+	// a closure with its own panic recovery so one bad event is logged and
+	// skipped rather than killing the loop and silently halting all delivery.
 	go func() {
-		for evt := range events {
+		defer safe.Recover("consume loop")
+		dispatch := func(evt delivery.Event) {
+			defer safe.Recover("consume dispatch")
+
 			verdict := guard.Check(evt.From)
 			switch verdict {
 			case security.Deny:
@@ -170,10 +176,10 @@ func main() {
 						log.Printf("guard: failed to send deny message to %s: %v", evt.From, err)
 					}
 				}
-				continue
+				return
 			case security.RateLimited:
 				log.Printf("guard: rate limited sender %s", evt.From)
-				continue
+				return
 			}
 
 			role := guard.Role(evt.From)
@@ -182,11 +188,14 @@ func main() {
 			// Bridge commands are intercepted before the gateway.
 			if dispatcher.IsCommand(evt.Text) {
 				go handleCommand(ctx, dispatcher, gw, client, evt, sessionKey, role)
-				continue
+				return
 			}
 
 			// Forward to gateway and wait for agent reply in a goroutine.
 			go handleMessage(ctx, gw, client, evt, sessionKey, role, cfg.Gateway.ErrorMessage)
+		}
+		for evt := range events {
+			dispatch(evt)
 		}
 	}()
 
@@ -200,6 +209,7 @@ func main() {
 // handleCommand dispatches a bridge-level command and sends the reply to WhatsApp.
 // Commands are executed without involving the AI gateway (except agent-type commands).
 func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gateway, client *kapso.Client, evt delivery.Event, sessionKey, role string) {
+	defer safe.Recover("handleCommand")
 	from := evt.From
 	if !strings.HasPrefix(from, "+") {
 		from = "+" + from
@@ -269,6 +279,7 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 // handleMessage sends a message to the gateway, waits for the agent's reply,
 // and sends it back to the WhatsApp sender.
 func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client, evt delivery.Event, sessionKey, role, errorMessage string) {
+	defer safe.Recover("handleMessage")
 	from := evt.From
 	if !strings.HasPrefix(from, "+") {
 		from = "+" + from
@@ -283,6 +294,7 @@ func handleMessage(ctx context.Context, gw gateway.Gateway, client *kapso.Client
 	typingCtx, typingCancel := context.WithCancel(ctx)
 	defer typingCancel()
 	go func() {
+		defer safe.Recover("typing refresh")
 		ticker := time.NewTicker(20 * time.Second)
 		defer ticker.Stop()
 		for {

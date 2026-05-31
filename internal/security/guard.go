@@ -35,6 +35,8 @@ type Guard struct {
 	now         func() time.Time
 	mu          sync.Mutex
 	buckets     map[string]*bucket
+	sweepEvery  time.Duration
+	lastSweep   time.Time
 }
 
 // New creates a Guard from the security config. It inverts the role→[]phones
@@ -50,16 +52,27 @@ func New(cfg config.SecurityConfig) *Guard {
 		}
 	}
 
+	rateWindow := time.Duration(cfg.RateWindow) * time.Second
+	// Sweep stale buckets no more than once per window so the map cannot grow
+	// unbounded with one entry per distinct sender. Floored so a tiny or zero
+	// window does not turn every Check into a full-map scan.
+	sweepEvery := rateWindow
+	if sweepEvery < time.Minute {
+		sweepEvery = time.Minute
+	}
+
 	return &Guard{
 		mode:        cfg.Mode,
 		phoneTo:     phoneTo,
 		defaultRole: cfg.DefaultRole,
 		denyMessage: cfg.DenyMessage,
 		rateLimit:   cfg.RateLimit,
-		rateWindow:  time.Duration(cfg.RateWindow) * time.Second,
+		rateWindow:  rateWindow,
 		isolate:     cfg.SessionIsolation,
 		now:         time.Now,
 		buckets:     make(map[string]*bucket),
+		sweepEvery:  sweepEvery,
+		lastSweep:   time.Now(),
 	}
 }
 
@@ -77,6 +90,17 @@ func (g *Guard) Check(from string) Verdict {
 	defer g.mu.Unlock()
 
 	now := g.now()
+
+	// Periodically reap expired buckets so idle senders do not accumulate.
+	if now.Sub(g.lastSweep) >= g.sweepEvery {
+		for k, bk := range g.buckets {
+			if now.After(bk.windowEnd) {
+				delete(g.buckets, k)
+			}
+		}
+		g.lastSweep = now
+	}
+
 	b, ok := g.buckets[n]
 	if !ok || now.After(b.windowEnd) {
 		g.buckets[n] = &bucket{

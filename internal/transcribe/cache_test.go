@@ -3,6 +3,7 @@ package transcribe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -154,5 +155,59 @@ func TestCacheTranscriber(t *testing.T) {
 				t.Errorf("inner called %d times, want %d", mock.calls, tc.wantCalls)
 			}
 		})
+	}
+}
+
+// TestCacheEvictionBounded verifies the cache cannot grow past maxEntries no
+// matter how many unique audio messages arrive.
+func TestCacheEvictionBounded(t *testing.T) {
+	ctx := context.Background()
+	mock := &cacheTestMock{results: []mockResult{{text: "ok", err: nil}}}
+	ct := newCacheTranscriber(mock, time.Hour)
+	ct.maxEntries = 4
+
+	for i := 0; i < 50; i++ {
+		if _, err := ct.Transcribe(ctx, []byte(fmt.Sprintf("audio-%d", i)), "audio/ogg"); err != nil {
+			t.Fatalf("Transcribe %d: %v", i, err)
+		}
+	}
+
+	ct.mu.Lock()
+	n := len(ct.items)
+	ct.mu.Unlock()
+	if n > ct.maxEntries {
+		t.Fatalf("cache holds %d entries, want <= %d", n, ct.maxEntries)
+	}
+}
+
+// TestCacheEvictsExpiredOnWrite verifies expired entries are dropped when a new
+// entry is stored, rather than lingering forever.
+func TestCacheEvictsExpiredOnWrite(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(0, 0)
+	mock := &cacheTestMock{results: []mockResult{{text: "ok", err: nil}}}
+	ct := newCacheTranscriber(mock, time.Minute)
+	ct.maxEntries = 100
+	ct.nowFunc = func() time.Time { return now }
+
+	if _, err := ct.Transcribe(ctx, []byte("A"), "audio/ogg"); err != nil {
+		t.Fatalf("store A: %v", err)
+	}
+
+	// Advance past A's TTL, then store B — storing must evict the expired A.
+	now = now.Add(2 * time.Minute)
+	if _, err := ct.Transcribe(ctx, []byte("B"), "audio/ogg"); err != nil {
+		t.Fatalf("store B: %v", err)
+	}
+
+	ct.mu.Lock()
+	_, hasA := ct.items[ct.cacheKey([]byte("A"))]
+	_, hasB := ct.items[ct.cacheKey([]byte("B"))]
+	ct.mu.Unlock()
+	if hasA {
+		t.Error("expired entry A was not evicted on write")
+	}
+	if !hasB {
+		t.Error("fresh entry B is missing")
 	}
 }

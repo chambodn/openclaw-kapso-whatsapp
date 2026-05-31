@@ -11,14 +11,20 @@ import (
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/gorilla/websocket"
 )
 
 // senderConn holds a per-sender WebSocket connection and its I/O mutex.
 type senderConn struct {
-	conn *websocket.Conn
-	ioMu sync.Mutex // serialises write+read cycles on this connection
+	conn     *websocket.Conn
+	ioMu     sync.Mutex // serialises write+read cycles on this connection
+	lastUsed time.Time  // guarded by ZeroClaw.mu; drives idle reaping
 }
+
+// defaultIdleTTL is how long a per-sender connection may sit unused before the
+// reaper closes it, releasing the socket and freeing gateway-side slots.
+const defaultIdleTTL = 30 * time.Minute
 
 // ZeroClaw implements Gateway for the ZeroClaw agent runtime.
 // It communicates via WebSocket at /ws/chat with streaming responses.
@@ -27,8 +33,10 @@ type senderConn struct {
 // connection so that ZeroClaw maintains separate conversation histories
 // per user. Messages from different senders never share context.
 type ZeroClaw struct {
-	url   string
-	token string
+	url     string
+	token   string
+	idleTTL time.Duration
+	nowFunc func() time.Time // clock; set by NewZeroClaw, overridable in tests
 
 	mu    sync.Mutex             // guards conns map
 	conns map[string]*senderConn // sender key → connection
@@ -37,9 +45,11 @@ type ZeroClaw struct {
 // NewZeroClaw creates a ZeroClaw gateway from config.
 func NewZeroClaw(cfg config.GatewayConfig) *ZeroClaw {
 	return &ZeroClaw{
-		url:   cfg.URL,
-		token: cfg.Token,
-		conns: make(map[string]*senderConn),
+		url:     cfg.URL,
+		token:   cfg.Token,
+		idleTTL: defaultIdleTTL,
+		nowFunc: time.Now,
+		conns:   make(map[string]*senderConn),
 	}
 }
 
@@ -56,6 +66,11 @@ func (zc *ZeroClaw) Connect(ctx context.Context) error {
 	zc.conns[""] = &senderConn{conn: conn}
 	zc.mu.Unlock()
 
+	// Reap idle per-sender connections until the daemon shuts down.
+	if zc.idleTTL > 0 {
+		go zc.reapLoop(ctx)
+	}
+
 	log.Printf("connected to zeroclaw at %s", zc.url)
 	return nil
 }
@@ -71,6 +86,13 @@ func (zc *ZeroClaw) SendAndReceive(ctx context.Context, req *Request) (string, e
 
 	sc.ioMu.Lock()
 	defer sc.ioMu.Unlock()
+
+	// Bound reads by the caller's deadline so a half-open connection cannot hang
+	// this goroutine indefinitely. Cleared on return since the conn is reused.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = sc.conn.SetReadDeadline(deadline)
+		defer func() { _ = sc.conn.SetReadDeadline(time.Time{}) }()
+	}
 
 	// Send message — ZeroClaw takes raw text content.
 	msg := map[string]string{
@@ -150,6 +172,9 @@ func (zc *ZeroClaw) connFor(ctx context.Context, from string) (*senderConn, erro
 
 	zc.mu.Lock()
 	sc, ok := zc.conns[key]
+	if ok {
+		sc.lastUsed = zc.nowFunc()
+	}
 	zc.mu.Unlock()
 	if ok {
 		return sc, nil
@@ -165,10 +190,12 @@ func (zc *ZeroClaw) connFor(ctx context.Context, from string) (*senderConn, erro
 	zc.mu.Lock()
 	// Double-check: another goroutine may have raced us.
 	if existing, ok := zc.conns[key]; ok {
+		existing.lastUsed = zc.nowFunc()
 		zc.mu.Unlock()
 		_ = conn.Close()
 		return existing, nil
 	}
+	sc.lastUsed = zc.nowFunc()
 	zc.conns[key] = sc
 	zc.mu.Unlock()
 
@@ -204,6 +231,49 @@ func (zc *ZeroClaw) removeSender(key string) {
 	}
 	delete(zc.conns, key)
 	zc.mu.Unlock()
+}
+
+// reapLoop periodically closes per-sender connections that have been idle
+// longer than idleTTL. It runs until ctx is cancelled (daemon shutdown).
+func (zc *ZeroClaw) reapLoop(ctx context.Context) {
+	defer safe.Recover("zeroclaw reapLoop")
+	ticker := time.NewTicker(zc.idleTTL / 2)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			zc.reapIdle(zc.nowFunc())
+		}
+	}
+}
+
+// reapIdle closes and removes per-sender connections idle since before
+// now-idleTTL. The default connection (key "") is never reaped. A connection
+// currently mid-request holds its ioMu, so TryLock skips it.
+func (zc *ZeroClaw) reapIdle(now time.Time) {
+	var toClose []*senderConn
+
+	zc.mu.Lock()
+	for key, sc := range zc.conns {
+		if key == "" || now.Sub(sc.lastUsed) < zc.idleTTL {
+			continue
+		}
+		if !sc.ioMu.TryLock() {
+			continue // in use — leave it for the next sweep
+		}
+		delete(zc.conns, key)
+		toClose = append(toClose, sc)
+		log.Printf("zeroclaw: reaped idle session for sender %s", key)
+	}
+	zc.mu.Unlock()
+
+	// Close outside the map lock; ioMu is held so no one can start using it.
+	for _, sc := range toClose {
+		_ = sc.conn.Close()
+		sc.ioMu.Unlock()
+	}
 }
 
 // senderKey normalises a phone number into a map key. Empty From (CLI usage)

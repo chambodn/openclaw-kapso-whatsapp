@@ -9,9 +9,74 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
+
+// TestZeroClawReapsIdleConnections verifies idle per-sender connections are
+// closed and removed by the reaper, while the default connection is exempt.
+func TestZeroClawReapsIdleConnections(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	clock := time.Unix(1000, 0)
+	zc := &ZeroClaw{
+		url:     wsURL,
+		idleTTL: 30 * time.Minute,
+		nowFunc: func() time.Time { return clock },
+		conns:   make(map[string]*senderConn),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := zc.Connect(ctx); err != nil {
+		t.Fatalf("Connect() failed: %v", err)
+	}
+	defer func() { _ = zc.Close() }()
+
+	if _, err := zc.connFor(ctx, "+15551230000"); err != nil {
+		t.Fatalf("connFor() failed: %v", err)
+	}
+
+	zc.mu.Lock()
+	before := len(zc.conns)
+	zc.mu.Unlock()
+	if before != 2 {
+		t.Fatalf("expected 2 connections (default + sender), got %d", before)
+	}
+
+	// Advance beyond idleTTL and reap.
+	zc.reapIdle(clock.Add(31 * time.Minute))
+
+	zc.mu.Lock()
+	_, hasSender := zc.conns[senderKey("+15551230000")]
+	_, hasDefault := zc.conns[""]
+	remaining := len(zc.conns)
+	zc.mu.Unlock()
+
+	if hasSender {
+		t.Error("idle per-sender connection was not reaped")
+	}
+	if !hasDefault {
+		t.Error("default connection was wrongly reaped")
+	}
+	if remaining != 1 {
+		t.Fatalf("expected 1 connection after reap, got %d", remaining)
+	}
+}
 
 // TestZeroClawSendAndReceive verifies the full send→done flow.
 func TestZeroClawSendAndReceive(t *testing.T) {
@@ -48,7 +113,7 @@ func TestZeroClawSendAndReceive(t *testing.T) {
 	defer close(done)
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, token: "test-token", conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, token: "test-token", nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -107,7 +172,7 @@ func TestZeroClawErrorResponse(t *testing.T) {
 	defer close(done)
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -146,7 +211,7 @@ func TestZeroClawConnectSendsAuthToken(t *testing.T) {
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
 	wantToken := "my-secret-zeroclaw-token"
-	zc := &ZeroClaw{url: wsURL, token: wantToken, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, token: wantToken, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -214,7 +279,7 @@ func TestZeroClawSessionIsolation(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
@@ -321,7 +386,7 @@ func TestZeroClawSameSenderReuseConn(t *testing.T) {
 	defer srv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
-	zc := &ZeroClaw{url: wsURL, conns: make(map[string]*senderConn)}
+	zc := &ZeroClaw{url: wsURL, nowFunc: time.Now, conns: make(map[string]*senderConn)}
 
 	if err := zc.Connect(context.Background()); err != nil {
 		t.Fatalf("Connect() failed: %v", err)
