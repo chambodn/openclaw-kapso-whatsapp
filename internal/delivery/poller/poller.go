@@ -54,52 +54,78 @@ func (p *Poller) Run(ctx context.Context, out chan<- delivery.Event) error {
 	}
 }
 
+// maxPollPages bounds how many pages a single poll cycle will drain. The Kapso
+// list API returns at most Limit messages per page; following the `after`
+// cursor lets one cycle consume a full backlog instead of silently dropping
+// everything past the first page. The cap guards against a misbehaving API
+// (e.g. a non-terminating cursor) rather than the normal workload. Because the
+// API walks forward in time, advancing the cursor to the newest message we did
+// fetch is safe when the cap is hit — newer messages are picked up next cycle
+// by the `since` filter.
+const maxPollPages = 100
+
 func (p *Poller) poll(lastPoll *time.Time, out chan<- delivery.Event) {
 	since := lastPoll.Format(time.RFC3339)
 
-	resp, err := p.Client.ListMessages(kapso.ListMessagesParams{
-		Direction: "inbound",
-		Since:     since,
-		Limit:     100,
-	})
-	if err != nil {
-		log.Printf("poll error: %v", err)
-		return
-	}
-
-	if len(resp.Data) == 0 {
-		return
-	}
-
 	var newest time.Time
 	forwarded := 0
+	after := ""
 
-	for _, msg := range resp.Data {
-		// Track timestamp for ALL messages so the cursor advances past
-		// unsupported types (stickers, contacts, etc.) and they are not
-		// re-fetched on the next poll cycle.
-		msgTime := parseTimestamp(msg.Timestamp)
-		if !msgTime.IsZero() && msgTime.After(newest) {
-			newest = msgTime
+	for page := 0; page < maxPollPages; page++ {
+		resp, err := p.Client.ListMessages(kapso.ListMessagesParams{
+			Direction: "inbound",
+			Since:     since,
+			Limit:     100,
+			After:     after,
+		})
+		if err != nil {
+			// Do not advance the cursor on a mid-drain error; retry next cycle.
+			log.Printf("poll error: %v", err)
+			return
 		}
 
-		text, ok := delivery.ExtractText(msg.Message, p.Client, p.Transcriber, p.MaxAudioSize)
-		if !ok {
-			continue
+		for _, msg := range resp.Data {
+			// Track timestamp for ALL messages so the cursor advances past
+			// unsupported types (stickers, contacts, etc.) and they are not
+			// re-fetched on the next poll cycle.
+			msgTime := parseTimestamp(msg.Timestamp)
+			if !msgTime.IsZero() && msgTime.After(newest) {
+				newest = msgTime
+			}
+
+			text, ok := delivery.ExtractText(msg.Message, p.Client, p.Transcriber, p.MaxAudioSize)
+			if !ok {
+				continue
+			}
+
+			name := ""
+			if msg.Kapso != nil {
+				name = msg.Kapso.ContactName
+			}
+
+			out <- delivery.Event{
+				ID:   msg.ID,
+				From: msg.From,
+				Name: name,
+				Text: text,
+			}
+			forwarded++
 		}
 
-		name := ""
-		if msg.Kapso != nil {
-			name = msg.Kapso.ContactName
+		next := ""
+		if resp.Paging != nil {
+			next = resp.Paging.Cursors.After
 		}
+		// Stop when there is no next page, the page was empty, or the cursor
+		// failed to advance (defensive against a stuck cursor that would loop).
+		if next == "" || len(resp.Data) == 0 || next == after {
+			break
+		}
+		after = next
 
-		out <- delivery.Event{
-			ID:   msg.ID,
-			From: msg.From,
-			Name: name,
-			Text: text,
+		if page == maxPollPages-1 {
+			log.Printf("WARN: poll hit max page limit (%d); newer messages will be fetched next cycle", maxPollPages)
 		}
-		forwarded++
 	}
 
 	if forwarded > 0 {
