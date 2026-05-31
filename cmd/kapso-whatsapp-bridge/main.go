@@ -44,8 +44,16 @@ func main() {
 	}
 
 	mode := cfg.Delivery.Mode
-	if (mode == "tailscale" || mode == "domain") && cfg.Webhook.VerifyToken == "" {
-		log.Fatal("KAPSO_WEBHOOK_VERIFY_TOKEN must be set when using tailscale or domain mode")
+	if mode == "tailscale" || mode == "domain" {
+		if cfg.Webhook.VerifyToken == "" {
+			log.Fatal("KAPSO_WEBHOOK_VERIFY_TOKEN must be set when using tailscale or domain mode")
+		}
+		// The webhook is publicly reachable in these modes. Without a secret,
+		// HMAC verification is skipped and anyone who learns the URL can POST a
+		// forged payload with an allowlisted sender. Require it to fail closed.
+		if cfg.Webhook.Secret == "" {
+			log.Fatal("KAPSO_WEBHOOK_SECRET must be set when using tailscale or domain mode: the webhook is publicly reachable and unsigned requests would otherwise be accepted")
+		}
 	}
 
 	// Graceful shutdown.
