@@ -6,11 +6,11 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
+	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/phone"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/gorilla/websocket"
 )
@@ -279,15 +279,5 @@ func (zc *ZeroClaw) reapIdle(now time.Time) {
 // senderKey normalises a phone number into a map key. Empty From (CLI usage)
 // maps to "" which hits the default probe connection from Connect().
 func senderKey(from string) string {
-	if from == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(from))
-	for _, r := range from {
-		if r >= '0' && r <= '9' {
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
+	return phone.Normalize(from)
 }

@@ -134,7 +134,7 @@ func TestShellCommandOutput(t *testing.T) {
 		"greet": {Type: "shell", Shell: "echo hello"},
 	})
 
-	reply := d.Handle(context.Background(), "greet", "", "admin", "s", nil, &gateway.Request{}, nil)
+	reply := d.Handle(context.Background(), "greet", "", "admin", "s", nil, &gateway.Request{})
 	if reply != "hello" {
 		t.Errorf("expected 'hello', got %q", reply)
 	}
@@ -146,7 +146,7 @@ func TestShellCommandArgsViaEnv(t *testing.T) {
 		"echo": {Type: "shell", Shell: "echo $ARGS"},
 	})
 
-	reply := d.Handle(context.Background(), "echo", "world", "admin", "s", nil, &gateway.Request{}, nil)
+	reply := d.Handle(context.Background(), "echo", "world", "admin", "s", nil, &gateway.Request{})
 	if reply != "world" {
 		t.Errorf("expected 'world' via $ARGS, got %q", reply)
 	}
@@ -164,7 +164,7 @@ func TestShellTemplateArgsNotInterpolated(t *testing.T) {
 	// If {args} were substituted: shell runs "echo data; echo INJECTED"
 	// → two lines of output, second being "INJECTED".
 	// Without substitution: shell runs "echo {args}" → prints "{args}".
-	reply := d.Handle(context.Background(), "cmd", "data; echo INJECTED", "admin", "s", nil, &gateway.Request{}, nil)
+	reply := d.Handle(context.Background(), "cmd", "data; echo INJECTED", "admin", "s", nil, &gateway.Request{})
 
 	if strings.Contains(reply, "INJECTED") {
 		t.Errorf("{args} was interpolated into the shell template — injection succeeded: %q", reply)
@@ -186,7 +186,7 @@ func TestShellCommandTimeout(t *testing.T) {
 	})
 
 	start := time.Now()
-	reply := d.Handle(context.Background(), "slow", "", "admin", "s", nil, &gateway.Request{}, nil)
+	reply := d.Handle(context.Background(), "slow", "", "admin", "s", nil, &gateway.Request{})
 	elapsed := time.Since(start)
 
 	if !strings.Contains(reply, "timed out") {
@@ -203,7 +203,7 @@ func TestShellOutputTruncation(t *testing.T) {
 		"big": {Type: "shell", Shell: "head -c 5001 /dev/zero | tr '\\0' 'x'"},
 	})
 
-	reply := d.Handle(context.Background(), "big", "", "admin", "s", nil, &gateway.Request{}, nil)
+	reply := d.Handle(context.Background(), "big", "", "admin", "s", nil, &gateway.Request{})
 	if len(reply) > maxOutputLen+50 { // small buffer for the truncation suffix
 		t.Errorf("output not truncated: len=%d", len(reply))
 	}
@@ -221,7 +221,7 @@ func TestAgentCommandSendsTemplatedPrompt(t *testing.T) {
 	})
 
 	req := &gateway.Request{IdempotencyKey: "msg1", From: "+1234", Role: "member"}
-	reply := d.Handle(context.Background(), "ask", "hello", "member", "sess", gw, req, nil)
+	reply := d.Handle(context.Background(), "ask", "hello", "member", "sess", gw, req)
 
 	if reply != "agent says hi" {
 		t.Errorf("unexpected reply: %q", reply)
@@ -241,7 +241,7 @@ func TestAgentCommandPropagatesError(t *testing.T) {
 	})
 
 	req := &gateway.Request{}
-	reply := d.Handle(context.Background(), "ask", "anything", "admin", "s", gw, req, nil)
+	reply := d.Handle(context.Background(), "ask", "anything", "admin", "s", gw, req)
 	if !strings.Contains(reply, "Agent error") {
 		t.Errorf("expected agent error message, got %q", reply)
 	}
@@ -255,7 +255,7 @@ func TestHelpFiltersbyRole(t *testing.T) {
 		"secret": {Type: "shell", Shell: "id", Description: "admin only", Roles: []string{"admin"}},
 	})
 
-	memberHelp := d.Handle(context.Background(), "help", "", "member", "s", nil, &gateway.Request{}, nil)
+	memberHelp := d.Handle(context.Background(), "help", "", "member", "s", nil, &gateway.Request{})
 	if strings.Contains(memberHelp, "secret") {
 		t.Error("member help should not expose admin-only command")
 	}
@@ -263,7 +263,7 @@ func TestHelpFiltersbyRole(t *testing.T) {
 		t.Error("member help should include public command")
 	}
 
-	adminHelp := d.Handle(context.Background(), "help", "", "admin", "s", nil, &gateway.Request{}, nil)
+	adminHelp := d.Handle(context.Background(), "help", "", "admin", "s", nil, &gateway.Request{})
 	if !strings.Contains(adminHelp, "secret") {
 		t.Error("admin help should include admin-only command")
 	}
@@ -274,7 +274,7 @@ func TestHelpNoCommandsForRole(t *testing.T) {
 		"admin-only": {Type: "shell", Shell: "id", Roles: []string{"admin"}},
 	})
 
-	reply := d.Handle(context.Background(), "help", "", "guest", "s", nil, &gateway.Request{}, nil)
+	reply := d.Handle(context.Background(), "help", "", "guest", "s", nil, &gateway.Request{})
 	if !strings.Contains(reply, "No commands available") {
 		t.Errorf("expected no-commands message for role with no access, got %q", reply)
 	}

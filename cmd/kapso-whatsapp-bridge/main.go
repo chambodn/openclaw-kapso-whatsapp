@@ -261,7 +261,7 @@ func handleCommand(ctx context.Context, d *commands.Dispatcher, gw gateway.Gatew
 		FromName:       evt.Name,
 		Role:           role,
 	}
-	reply := d.Handle(ctx, name, args, role, sessionKey, gw, req, client)
+	reply := d.Handle(ctx, name, args, role, sessionKey, gw, req)
 	if reply != "" {
 		chunks := gateway.SplitMessage(gateway.MdToWhatsApp(reply), 4096)
 		for _, chunk := range chunks {

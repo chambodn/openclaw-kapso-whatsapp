@@ -15,7 +15,6 @@ import (
 
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/config"
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/gateway"
-	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/kapso"
 )
 
 const maxOutputLen = 4000
@@ -113,7 +112,6 @@ func (d *Dispatcher) Handle(
 	name, args, role, sessionKey string,
 	gw gateway.Gateway,
 	req *gateway.Request,
-	_ *kapso.Client,
 ) string {
 	if name == "help" {
 		return d.helpText(role)
