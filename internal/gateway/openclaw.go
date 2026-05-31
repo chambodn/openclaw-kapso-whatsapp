@@ -510,6 +510,8 @@ func (oc *OpenClaw) pollReply(ctx context.Context, sessionKey string) (string, e
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	loggedMissing := false
+
 	for {
 		if time.Now().After(deadline) {
 			return "", fmt.Errorf("timeout waiting for agent reply (session %s)", sessionKey)
@@ -524,8 +526,12 @@ func (oc *OpenClaw) pollReply(ctx context.Context, sessionKey string) (string, e
 		sessionFile, err := getSessionFile(oc.sessionsJSON, sessionKey)
 		if err != nil {
 			// Fail closed — keep polling this session only; never substitute
-			// another session's transcript.
-			log.Printf("openclaw: %v", err)
+			// another session's transcript. Log only the first occurrence so a
+			// stuck request produces one line, not one per tick.
+			if !loggedMissing {
+				log.Printf("openclaw: %v", err)
+				loggedMissing = true
+			}
 			continue
 		}
 

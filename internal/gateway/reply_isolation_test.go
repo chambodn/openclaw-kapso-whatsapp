@@ -47,6 +47,16 @@ func TestGetSessionFileLowercasesKey(t *testing.T) {
 	if got, err := getSessionFile(sessionsJSON, "BOT-WA-15"); err != nil || got != "/tmp/f.jsonl" {
 		t.Fatalf("expected case-insensitive exact match, got %q %v", got, err)
 	}
+
+	// Mixed-case input must also reach the canonical "agent:KEY:KEY" entry:
+	// the lowercased key builds "agent:bot-wa-15:bot-wa-15".
+	canonicalJSON := filepath.Join(t.TempDir(), "sessions.json")
+	if err := os.WriteFile(canonicalJSON, []byte(`{"agent:bot-wa-15:bot-wa-15": {"sessionFile": "/tmp/c.jsonl"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := getSessionFile(canonicalJSON, "BOT-WA-15"); err != nil || got != "/tmp/c.jsonl" {
+		t.Fatalf("expected canonical fallback via lowercased key, got %q %v", got, err)
+	}
 }
 
 // TestPollReplyFailsClosedOnMissingPerSenderSession verifies pollReply never
@@ -87,5 +97,43 @@ func TestPollReplyFailsClosedOnMissingPerSenderSession(t *testing.T) {
 	}
 	if text != "" {
 		t.Fatalf("fail-closed violated: leaked reply %q from another session", text)
+	}
+}
+
+// TestPollReplyDeliversReplyFromPerSenderSession verifies the success path the
+// fallback removal makes load-bearing: when the per-sender session EXISTS and
+// has a ready assistant reply, pollReply resolves that session and delivers it.
+func TestPollReplyDeliversReplyFromPerSenderSession(t *testing.T) {
+	dir := t.TempDir()
+	sessionsJSON := filepath.Join(dir, "sessions.json")
+	senderFile := filepath.Join(dir, "sender.jsonl")
+
+	// The per-sender session exists and has a ready assistant reply.
+	if err := os.WriteFile(sessionsJSON, []byte(`{"bot-wa-15": {"sessionFile": "`+senderFile+`"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now().UTC().Add(time.Hour).Format(time.RFC3339)
+	reply := `{"type":"message","timestamp":"` + ts + `","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"per-sender reply"}]}}`
+	if err := os.WriteFile(senderFile, []byte(reply+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	oc := &OpenClaw{
+		sessionsJSON: sessionsJSON,
+		sessionKey:   "bot",
+		tracker:      newReplyTracker(),
+		pollInterval: 2 * time.Millisecond,
+	}
+
+	// Generous timeout as a safety net; the reply should arrive within a tick.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	text, err := oc.pollReply(ctx, "bot-wa-15")
+	if err != nil {
+		t.Fatalf("expected reply delivery, got err=%v", err)
+	}
+	if text != "per-sender reply" {
+		t.Fatalf("expected %q, got %q", "per-sender reply", text)
 	}
 }
