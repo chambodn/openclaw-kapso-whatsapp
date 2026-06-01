@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -17,6 +18,11 @@ import (
 	"github.com/Enriquefft/openclaw-kapso-whatsapp/internal/safe"
 	"github.com/gorilla/websocket"
 )
+
+// errPermanent marks a connect failure that retrying cannot fix (e.g. the
+// gateway rejected the auth handshake), so the supervisor must stop reconnecting
+// rather than loop forever.
+var errPermanent = errors.New("gateway connect permanently rejected")
 
 // OpenClaw protocol types.
 
@@ -117,6 +123,28 @@ type assistantReply struct {
 	Text string
 }
 
+// connSession holds the state for one live gateway connection. A fresh one is
+// created on every (re)connect; readLoop, pingLoop, and sendRequest each bind to
+// a specific session, so a reconnect can never tangle two generations (e.g.
+// route a response to the wrong connection's pending map, or close the wrong
+// done channel).
+type connSession struct {
+	conn    *websocket.Conn
+	wmu     sync.Mutex // serialises WriteMessage calls + seq on this conn
+	seq     int
+	pendMu  sync.Mutex
+	pending map[string]chan responseFrame // request id -> response channel
+	done    chan struct{}                 // closed once readLoop exits
+}
+
+func (cs *connSession) nextID() string {
+	cs.wmu.Lock()
+	cs.seq++
+	id := cs.seq
+	cs.wmu.Unlock()
+	return fmt.Sprintf("kapso-%d", id)
+}
+
 // OpenClaw implements Gateway for the OpenClaw agent runtime.
 type OpenClaw struct {
 	url          string
@@ -126,30 +154,49 @@ type OpenClaw struct {
 	sessionKey   string
 	role         string
 	scopes       []string
-
-	conn         *websocket.Conn
-	mu           sync.Mutex // guards conn, seq, and writes
-	seq          int
 	tracker      *replyTracker
 	pollInterval time.Duration // session-poll cadence; injectable for tests
 
-	// Response routing: readLoop routes "res" frames to pending callers.
-	pending map[string]chan responseFrame
-	pendMu  sync.Mutex    // guards pending map (separate from mu)
-	done    chan struct{} // closed when readLoop exits
+	autoReconnect bool // reconnect on drop; true via the production constructors
+
+	// initialBackoff is the first wait after a rapid drop; it doubles up to the
+	// 30s cap. Zero means the default of one second. Injectable so tests can use
+	// a tiny value rather than depending on real-time pacing (mirrors how
+	// pollInterval-style timings are injected elsewhere).
+	initialBackoff time.Duration
+
+	// startOnce guards the supervisor start so a second Connect call cannot spawn
+	// a second supervisor goroutine.
+	startOnce sync.Once
+
+	mu sync.Mutex // guards cur and closing
+	// cur is the current connection. It is nil before the first connect and
+	// during a reconnect window (cleared at the start of each reconnect attempt,
+	// re-set on success), so callers see a clean "not connected" state.
+	cur       *connSession
+	closing   chan struct{} // closed by Close to stop the supervisor
+	closeOnce sync.Once
+
+	// supervisorDone is closed when supervise() returns; only meaningful when
+	// autoReconnect is true (otherwise no supervisor is started and it stays
+	// open, so Close must not wait on it).
+	supervisorDone chan struct{}
 }
 
 // NewOpenClaw creates an OpenClaw gateway from config.
 func NewOpenClaw(cfg config.GatewayConfig) *OpenClaw {
 	return &OpenClaw{
-		url:          cfg.URL,
-		token:        cfg.Token,
-		sessionsJSON: cfg.SessionsJSON,
-		sessionKey:   cfg.SessionKey,
-		role:         cfg.Role,
-		scopes:       cfg.Scopes,
-		tracker:      newReplyTracker(),
-		pollInterval: 3 * time.Second,
+		url:            cfg.URL,
+		token:          cfg.Token,
+		sessionsJSON:   cfg.SessionsJSON,
+		sessionKey:     cfg.SessionKey,
+		role:           cfg.Role,
+		scopes:         cfg.Scopes,
+		tracker:        newReplyTracker(),
+		pollInterval:   3 * time.Second,
+		autoReconnect:  true,
+		closing:        make(chan struct{}),
+		supervisorDone: make(chan struct{}),
 	}
 }
 
@@ -160,16 +207,42 @@ func NewOpenClawWithSigner(cfg config.GatewayConfig, signer Signer) *OpenClaw {
 	return oc
 }
 
-func (oc *OpenClaw) nextID() string {
-	oc.seq++
-	return fmt.Sprintf("kapso-%d", oc.seq)
+// Connect establishes the first connection and, in production, starts the
+// supervisor that reconnects on drops.
+func (oc *OpenClaw) Connect(ctx context.Context) error {
+	// Reject a second Connect: a live session already exists, and starting a
+	// second supervisor (or replacing oc.cur) would orphan the first session and
+	// its loops.
+	oc.mu.Lock()
+	already := oc.cur != nil
+	oc.mu.Unlock()
+	if already {
+		return fmt.Errorf("already connected to gateway")
+	}
+
+	if err := oc.connectOnce(ctx); err != nil {
+		return err
+	}
+	if oc.autoReconnect {
+		// startOnce ensures only the first successful Connect spawns a
+		// supervisor, so supervisorDone is closed exactly once.
+		oc.startOnce.Do(func() {
+			go oc.supervise(ctx)
+		})
+	}
+	return nil
 }
 
-// Connect establishes the WebSocket connection and completes the
-// challenge-response auth handshake with the OpenClaw gateway.
-func (oc *OpenClaw) Connect(ctx context.Context) error {
+// connectOnce dials the gateway and completes the challenge-response auth
+// handshake, then installs the resulting connSession and starts its read/ping
+// loops. It is called for the initial connect and for every reconnect.
+func (oc *OpenClaw) connectOnce(ctx context.Context) error {
+	// Clear cur for the (re)connect window: during it sendRequest returns the
+	// clean "not connected to gateway" error rather than racing on a
+	// soon-to-be-closed conn, and Close sees nil.
 	oc.mu.Lock()
-	defer oc.mu.Unlock()
+	oc.cur = nil
+	oc.mu.Unlock()
 
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 10 * time.Second,
@@ -179,14 +252,17 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("connect to gateway: %w", err)
 	}
-	oc.conn = conn
+	cs := &connSession{
+		conn:    conn,
+		pending: make(map[string]chan responseFrame),
+		done:    make(chan struct{}),
+	}
 
 	// Read the challenge from the gateway.
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	_, msg, err := conn.ReadMessage()
 	if err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("read challenge: %w", err)
 	}
 
@@ -200,7 +276,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	}
 	if err := json.Unmarshal(msg, &challenge); err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("parse challenge frame: %w", err)
 	}
 
@@ -218,7 +293,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 		nonce := challenge.Payload.Nonce
 		if nonce == "" {
 			_ = conn.Close()
-			oc.conn = nil
 			return fmt.Errorf("gateway challenge missing nonce")
 		}
 		signedAt := time.Now().UnixMilli()
@@ -236,7 +310,7 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	// Send connect request.
 	connectReq := requestFrame{
 		Type:   "req",
-		ID:     oc.nextID(),
+		ID:     cs.nextID(),
 		Method: "connect",
 		Params: connectParams{
 			// Advertise a protocol range. The gateway accepts the connection
@@ -265,7 +339,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	data, err := json.Marshal(connectReq)
 	if err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("marshal connect request: %w", err)
 	}
 
@@ -273,7 +346,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 
 	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("send connect: %w", err)
 	}
 
@@ -282,7 +354,6 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	_, msg, err = conn.ReadMessage()
 	if err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("read connect response: %w", err)
 	}
 
@@ -291,41 +362,170 @@ func (oc *OpenClaw) Connect(ctx context.Context) error {
 	var resp responseFrame
 	if err := json.Unmarshal(msg, &resp); err != nil {
 		_ = conn.Close()
-		oc.conn = nil
 		return fmt.Errorf("parse connect response: %w", err)
 	}
 
 	if resp.Error != nil {
 		_ = conn.Close()
-		oc.conn = nil
-		return fmt.Errorf("connect rejected: %s", string(resp.Error))
+		return fmt.Errorf("connect rejected: %s: %w", string(resp.Error), errPermanent)
 	}
 
 	// Keepalive: bound reads so a half-open connection cannot hang readLoop
 	// (and every pending caller) indefinitely. The deadline is extended on any
 	// received frame and on pong replies; a ping is sent each pingPeriod.
 	//
-	// IMPORTANT: agent replies are delivered via JSONL polling (see pollReply),
-	// NOT over this socket, so in steady state the connection is data-idle and
-	// liveness depends entirely on the gateway answering our control pings with
-	// pongs. Standard RFC 6455 servers (including the OpenClaw gateway) do this
-	// automatically. A gateway that never ponged would have its connection torn
-	// down every pongWait; because this client does not yet auto-reconnect (see
-	// issue #5), that would break sends until the daemon restarts. If that ever
-	// regresses, add reconnect rather than removing the deadline.
+	// Agent replies are delivered via JSONL polling (see pollReply), NOT over
+	// this socket, so in steady state the connection is data-idle and liveness
+	// depends on the gateway answering our control pings with pongs (standard
+	// RFC 6455 behaviour). If a gateway never ponged, the connection would be
+	// torn down every pongWait; the supervisor then reconnects with backoff.
 	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
 
-	// Initialize response routing for the new connection.
-	oc.pending = make(map[string]chan responseFrame)
-	oc.done = make(chan struct{})
-	go oc.pingLoop(conn, oc.done)
-	go oc.readLoop()
+	oc.mu.Lock()
+	// If Close has already been requested, don't publish this session or start
+	// its loops; tear it down instead so Close can't race a freshly-installed
+	// connection it will never observe.
+	select {
+	case <-oc.closing:
+		oc.mu.Unlock()
+		_ = conn.Close()
+		return fmt.Errorf("gateway closing")
+	default:
+	}
+	oc.cur = cs
+	oc.mu.Unlock()
+	go oc.pingLoop(cs)
+	go oc.readLoop(cs)
 
 	log.Printf("authenticated with gateway at %s", oc.url)
 	return nil
+}
+
+// supervise reconnects the gateway whenever the live connection drops, until
+// the daemon context is cancelled or Close is called. It runs only when
+// autoReconnect is set (the production constructors). Each iteration waits for
+// the current session's readLoop to exit, then reconnects with backoff.
+func (oc *OpenClaw) supervise(ctx context.Context) {
+	// supervisorDone closes on every return path so Close can wait for the
+	// supervisor to exit. Registered before safe.Recover so (LIFO ordering) it
+	// runs after the panic handler — Close only unblocks once a panic, if any,
+	// has been handled.
+	defer close(oc.supervisorDone)
+	defer safe.Recover("openclaw supervise")
+
+	// On any exit, tear down the live socket so its readLoop errors out and both
+	// loops (read + ping) exit. Without this, cancelling ctx would stop the
+	// supervisor but leave the conn and its loops running. Closing a websocket
+	// conn twice is safe (it just returns an error), so this is fine even when
+	// Close() also closed the conn.
+	defer func() {
+		oc.mu.Lock()
+		cs := oc.cur
+		oc.cur = nil
+		oc.mu.Unlock()
+		if cs != nil {
+			_ = cs.conn.Close()
+		}
+	}()
+
+	// initialBackoff is the first wait after a rapid drop; it doubles up to
+	// maxBackoff. stableThreshold is how long a connection must stay up to be
+	// considered healthy: a connection that drops sooner is treated as a failed
+	// attempt so we pace (rather than busy-spin on) connect-drop-connect cycles.
+	const (
+		maxBackoff      = 30 * time.Second
+		stableThreshold = 5 * time.Second
+	)
+	initialBackoff := oc.initialBackoff
+	if initialBackoff <= 0 {
+		initialBackoff = time.Second
+	}
+	backoff := initialBackoff
+
+	for {
+		oc.mu.Lock()
+		cs := oc.cur
+		oc.mu.Unlock()
+		if cs == nil {
+			return
+		}
+
+		established := time.Now()
+		select {
+		case <-ctx.Done():
+			return
+		case <-oc.closing:
+			return
+		case <-cs.done:
+		}
+
+		// Connection dropped. Stop if we're shutting down; otherwise reconnect.
+		select {
+		case <-ctx.Done():
+			return
+		case <-oc.closing:
+			return
+		default:
+		}
+
+		if uptime := time.Since(established); uptime >= stableThreshold {
+			// Connection was healthy long enough; reset backoff.
+			backoff = initialBackoff
+			log.Printf("openclaw: gateway connection lost after %s, reconnecting...", uptime.Round(time.Millisecond))
+		} else {
+			// Rapid drop: pace the next attempt so we don't spin at zero delay.
+			log.Printf("openclaw: gateway connection dropped after %s, backing off %s before reconnecting", uptime.Round(time.Millisecond), backoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-oc.closing:
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+		}
+
+		if !oc.reconnect(ctx, &backoff, maxBackoff) {
+			return
+		}
+		log.Printf("openclaw: reconnected to gateway")
+	}
+}
+
+// reconnect retries connectOnce with exponential backoff until it succeeds or
+// the daemon is shutting down. It shares the supervisor's backoff value so a
+// rapid connect-drop-connect cycle keeps escalating rather than resetting. A
+// permanent failure (errPermanent) stops the retry loop. Returns false if it
+// stopped without connecting.
+func (oc *OpenClaw) reconnect(ctx context.Context, backoff *time.Duration, maxBackoff time.Duration) bool {
+	for {
+		err := oc.connectOnce(ctx)
+		if err == nil {
+			return true
+		}
+		if errors.Is(err, errPermanent) {
+			log.Printf("openclaw: reconnect aborted, permanent failure: %v", err)
+			return false
+		}
+		log.Printf("openclaw: reconnect attempt failed: %v (retrying in %s)", err, *backoff)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-oc.closing:
+			return false
+		case <-time.After(*backoff):
+		}
+		*backoff *= 2
+		if *backoff > maxBackoff {
+			*backoff = maxBackoff
+		}
+	}
 }
 
 // WebSocket keepalive timings. A ping is sent every pingPeriod; the read side
@@ -337,55 +537,49 @@ const (
 )
 
 // pingLoop sends a periodic WebSocket ping so an idle-but-healthy connection
-// stays alive and a dead one is detected within pongWait. WriteControl is
-// safe to call concurrently with the writes in sendRequest. It exits when the
-// connection's done channel is closed (i.e. readLoop has returned).
-func (oc *OpenClaw) pingLoop(conn *websocket.Conn, done chan struct{}) {
+// stays alive and a dead one is detected within pongWait. WriteControl is safe
+// to call concurrently with the writes in sendRequest. It exits when the
+// session's done channel is closed (i.e. readLoop has returned).
+func (oc *OpenClaw) pingLoop(cs *connSession) {
 	defer safe.Recover("openclaw pingLoop")
 	ticker := time.NewTicker(pingPeriod)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-done:
+		case <-cs.done:
 			return
 		case <-ticker.C:
-			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
+			if err := cs.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second)); err != nil {
 				return
 			}
 		}
 	}
 }
 
-// readLoop reads incoming frames and routes "res" frames to pending callers.
-// All other frames (events) are logged for observability. This is the sole
-// goroutine that reads from the WebSocket connection.
-func (oc *OpenClaw) readLoop() {
+// readLoop reads incoming frames for one connection and routes "res" frames to
+// that session's pending callers. It is the sole reader of the session's conn;
+// on exit it fails all pending callers and closes the session's done channel,
+// which is what the supervisor waits on to trigger a reconnect.
+func (oc *OpenClaw) readLoop(cs *connSession) {
 	defer safe.Recover("openclaw readLoop")
 	defer func() {
 		// Signal all pending sendRequest callers that the connection is gone.
-		oc.pendMu.Lock()
-		for id, ch := range oc.pending {
+		cs.pendMu.Lock()
+		for id, ch := range cs.pending {
 			close(ch)
-			delete(oc.pending, id)
+			delete(cs.pending, id)
 		}
-		oc.pendMu.Unlock()
-		close(oc.done)
+		cs.pendMu.Unlock()
+		close(cs.done)
 	}()
 
 	for {
-		oc.mu.Lock()
-		conn := oc.conn
-		oc.mu.Unlock()
-		if conn == nil {
-			return
-		}
-
-		_, msg, err := conn.ReadMessage()
+		_, msg, err := cs.conn.ReadMessage()
 		if err != nil {
 			return
 		}
 		// Any traffic proves the connection is alive — extend the deadline.
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = cs.conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var frame responseFrame
 		if err := json.Unmarshal(msg, &frame); err != nil {
@@ -395,12 +589,12 @@ func (oc *OpenClaw) readLoop() {
 
 		// Route responses to waiting callers by request ID.
 		if frame.Type == "res" && frame.ID != "" {
-			oc.pendMu.Lock()
-			if ch, ok := oc.pending[frame.ID]; ok {
+			cs.pendMu.Lock()
+			if ch, ok := cs.pending[frame.ID]; ok {
 				ch <- frame
-				delete(oc.pending, frame.ID)
+				delete(cs.pending, frame.ID)
 			}
-			oc.pendMu.Unlock()
+			cs.pendMu.Unlock()
 			continue
 		}
 
@@ -408,17 +602,101 @@ func (oc *OpenClaw) readLoop() {
 	}
 }
 
-// sendRequest sends a request frame and waits for the matching response.
-// The caller gets the full responseFrame so it can inspect Result or Error.
+// sendRequest sends a request frame and waits for the matching response. It
+// binds to the current connSession for its whole lifetime, so an in-flight
+// request is unaffected by a concurrent reconnect (it waits on its own session's
+// done channel, not a swapped field).
 func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params interface{}) (responseFrame, error) {
-	// Write phase — hold mu for conn check, ID generation, and write.
 	oc.mu.Lock()
-	if oc.conn == nil {
-		oc.mu.Unlock()
-		return responseFrame{}, fmt.Errorf("not connected to gateway")
+	cs := oc.cur
+	oc.mu.Unlock()
+
+	// If we're mid-reconnect (cur momentarily nil), wait for a fresh session
+	// rather than failing immediately. Fails fast if we're shutting down.
+	if cs == nil {
+		var err error
+		cs, err = oc.waitForSession(ctx, nil)
+		if err != nil {
+			return responseFrame{}, err
+		}
 	}
 
-	id := oc.nextID()
+	resp, err := oc.sendOnSession(ctx, cs, method, params)
+	if err == nil {
+		return resp, nil
+	}
+	// Only the bound-to-a-dead-session error is retryable: the write/connection
+	// failed because the session dropped during a reconnect. ctx errors and
+	// shutdown are terminal and already returned by sendOnSession as-is.
+	if !errors.Is(err, errSessionGone) {
+		return responseFrame{}, err
+	}
+
+	// Retrying on a fresh session only makes sense when a supervisor exists to
+	// publish one. Without autoReconnect, no new session will ever appear, so
+	// waiting would block forever (the ctx here may have no deadline). Return the
+	// errSessionGone-wrapped error immediately, preserving the contract that a
+	// dropped connection unblocks in-flight callers.
+	if !oc.autoReconnect {
+		return responseFrame{}, err
+	}
+
+	// Wait for a *new* live session (different generation) and retry once.
+	fresh, werr := oc.waitForSession(ctx, cs)
+	if werr != nil {
+		return responseFrame{}, werr
+	}
+	return oc.sendOnSession(ctx, fresh, method, params)
+}
+
+// errSessionGone marks a sendRequest failure caused by the bound session
+// dropping (write failed or its done channel closed). It is retryable on a
+// fresh session, unlike ctx cancellation or shutdown.
+var errSessionGone = errors.New("gateway session gone")
+
+// waitForSession blocks until oc.cur is a live session distinct from prev
+// (pass nil to accept any session). It returns fast if the gateway is shutting
+// down and respects the caller's ctx. It polls because reconnects publish a new
+// session without a dedicated signal; the poll is cheap and ctx-bounded.
+func (oc *OpenClaw) waitForSession(ctx context.Context, prev *connSession) (*connSession, error) {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		oc.mu.Lock()
+		cs := oc.cur
+		closing := oc.closing
+		oc.mu.Unlock()
+		if cs != nil && cs != prev {
+			return cs, nil
+		}
+
+		// Guard against a nil closing channel: receiving from nil blocks forever,
+		// which would make this select uncancellable via the closing path. ctx and
+		// the ticker still apply, so the loop remains bounded regardless.
+		if closing == nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-ticker.C:
+			}
+			continue
+		}
+
+		select {
+		case <-closing:
+			return nil, fmt.Errorf("not connected to gateway")
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// sendOnSession sends one request on a specific session and waits for its
+// response. It returns errSessionGone (wrapped) if the write fails or the
+// session drops while waiting, so the caller can retry on a fresh session.
+func (oc *OpenClaw) sendOnSession(ctx context.Context, cs *connSession, method string, params interface{}) (responseFrame, error) {
+	id := cs.nextID()
 	req := requestFrame{
 		Type:   "req",
 		ID:     id,
@@ -428,39 +706,41 @@ func (oc *OpenClaw) sendRequest(ctx context.Context, method string, params inter
 
 	data, err := json.Marshal(req)
 	if err != nil {
-		oc.mu.Unlock()
 		return responseFrame{}, fmt.Errorf("marshal %s request: %w", method, err)
 	}
 
 	// Register response channel before sending so readLoop can't race us.
 	ch := make(chan responseFrame, 1)
-	oc.pendMu.Lock()
-	oc.pending[id] = ch
-	oc.pendMu.Unlock()
+	cs.pendMu.Lock()
+	cs.pending[id] = ch
+	cs.pendMu.Unlock()
 
-	if err := oc.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-		oc.mu.Unlock()
-		oc.pendMu.Lock()
-		delete(oc.pending, id)
-		oc.pendMu.Unlock()
-		return responseFrame{}, fmt.Errorf("send %s: %w", method, err)
+	// Serialise writes on this conn (gorilla requires it); WriteControl pings
+	// from pingLoop remain safe concurrently.
+	cs.wmu.Lock()
+	err = cs.conn.WriteMessage(websocket.TextMessage, data)
+	cs.wmu.Unlock()
+	if err != nil {
+		cs.pendMu.Lock()
+		delete(cs.pending, id)
+		cs.pendMu.Unlock()
+		return responseFrame{}, fmt.Errorf("send %s: %w: %w", method, err, errSessionGone)
 	}
-	oc.mu.Unlock()
 
 	// Wait for readLoop to deliver the response.
 	select {
 	case resp, ok := <-ch:
 		if !ok {
-			return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response", method)
+			return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response: %w", method, errSessionGone)
 		}
 		return resp, nil
 	case <-ctx.Done():
-		oc.pendMu.Lock()
-		delete(oc.pending, id)
-		oc.pendMu.Unlock()
+		cs.pendMu.Lock()
+		delete(cs.pending, id)
+		cs.pendMu.Unlock()
 		return responseFrame{}, ctx.Err()
-	case <-oc.done:
-		return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response", method)
+	case <-cs.done:
+		return responseFrame{}, fmt.Errorf("connection closed while waiting for %s response: %w", method, errSessionGone)
 	}
 }
 
@@ -549,22 +829,30 @@ func (oc *OpenClaw) pollReply(ctx context.Context, sessionKey string) (string, e
 	}
 }
 
-// Close closes the WebSocket connection and waits for readLoop to exit.
+// Close stops the supervisor and closes the current connection, waiting for its
+// readLoop to exit.
 func (oc *OpenClaw) Close() error {
+	// Stop the supervisor first so it does not reconnect while we tear down.
 	oc.mu.Lock()
-	if oc.conn == nil {
-		oc.mu.Unlock()
-		return nil
+	if oc.closing != nil {
+		oc.closeOnce.Do(func() { close(oc.closing) })
 	}
-	err := oc.conn.Close()
-	oc.conn = nil
-	done := oc.done
+	cs := oc.cur
+	oc.cur = nil
 	oc.mu.Unlock()
 
-	// Wait for readLoop to finish cleanup. The wait is bounded because
-	// conn.Close() causes ReadMessage() to return an error immediately.
-	if done != nil {
-		<-done
+	var err error
+	if cs != nil {
+		err = cs.conn.Close()
+		// Wait for readLoop to finish cleanup. The wait is bounded because
+		// conn.Close() causes ReadMessage() to return an error immediately.
+		<-cs.done
+	}
+	// Wait for the supervisor to exit so it can't install a new session after
+	// Close returns. Only autoReconnect starts a supervisor; otherwise
+	// supervisorDone is never closed and waiting here would hang.
+	if oc.autoReconnect {
+		<-oc.supervisorDone
 	}
 	return err
 }
